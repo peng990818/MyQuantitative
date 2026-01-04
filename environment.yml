@@ -1,0 +1,14 @@
+name: quant
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pandas
+  - "numpy<2"  # 强制锁定 1.x 版本
+  - pip
+  - pip:
+      - ccxt
+      - pandas_ta
+      - python-dotenv  # 强烈建议增加这个，用于管理配置
+      - pysocks        # 解决 M4 芯片下 socks5 代理支持

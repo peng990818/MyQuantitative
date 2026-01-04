@@ -1,0 +1,19 @@
+# 排除 Conda 环境目录 (如果你把环境建在项目内部的文件夹里)
+.venv/
+env/
+venv/
+anaconda/
+
+# 排除 Python 编译字节码
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 排除 IDE 配置
+.idea/
+.vscode/
+
+# 排除 OKX API 密钥文件 (极其重要！防止误传到公网)
+config.json
+.env
+secret.py
