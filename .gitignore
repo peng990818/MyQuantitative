@@ -17,3 +17,5 @@ __pycache__/
 config.json
 .env
 secret.py
+
+*.csv
