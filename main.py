@@ -11,6 +11,7 @@ from trading_engine import OKXDemoTrader, OKXRealTrader, OKXPaperTrader
 from factor_engine import MultiFactorEngine
 from news_loader import NewsFetcher
 from model import SentimentAnalyst
+from notifier import EmailNotifier
 
 # 加载环境变量
 load_dotenv(override=True)
@@ -82,6 +83,7 @@ class QuantBotCommander:
         self.news_loader = NewsFetcher()
         self.analyst = SentimentAnalyst()
         self.pos_manager = PositionManager()
+        self.notifier = EmailNotifier()
 
         # 3. 状态缓存
         self.last_sentiment = {"score": 0, "reason": "Init"}
@@ -181,6 +183,7 @@ class QuantBotCommander:
                 avg_price = order.get('average', price)  # 尝试获取真实成交均价
                 self.pos_manager.save_state(True, avg_price)
                 print(f"✅ 买入成功，成本价记录为: {avg_price:.2f}")
+                self.notifier.send_buy_alert(SYMBOL, avg_price, self.qty, "策略信号触发 (1H)")
 
     def _try_sell(self, price, reason):
         # 只有持仓才卖
@@ -205,6 +208,20 @@ class QuantBotCommander:
             # 清除持仓状态
             self.pos_manager.save_state(False, 0.0)
             print(f"✅ 卖出成功，持仓已清空")
+
+            # 获取最新余额 (用于邮件展示)
+            new_bal = self.trader.get_account_balance()
+            total_usdt = new_bal.get('USDT', 0)
+
+            # 🔥 [新增] 发送邮件 (带盈亏计算)
+            self.notifier.send_sell_alert(
+                symbol=SYMBOL,
+                price=price,
+                qty=sell_qty,
+                reason=reason,
+                entry_price=entry_price,
+                balance=total_usdt
+            )
 
     def _force_sell(self, price, reason):
         """强制平仓（用于止损止盈）"""
