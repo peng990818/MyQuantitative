@@ -1,5 +1,7 @@
 import os
 import json
+import re
+import httpx
 import google.generativeai as genai
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -8,164 +10,208 @@ load_dotenv(override=True)
 
 
 # ==========================================
-# 1. 基础接口 (Interface)
+# 1. 基础接口
 # ==========================================
 class StrategyInterface:
-    """标准策略接口，所有模型必须实现此方法"""
-
-    def analyze(self, market_data):
+    def analyze(self, market_data, news_context=""):
         raise NotImplementedError
 
 
 # ==========================================
-# 2. 具体模型实现 (Implementations)
+# 2. 辅助工具：强制提取 JSON
 # ==========================================
-class GeminiStrategy(StrategyInterface):
-    """Google Gemini 模型具体实现"""
+def extract_json(text):
+    """
+    强制提取 JSON，兼容 DeepSeek R1 的 <think> 标签
+    """
+    if not text:
+        return None
 
+    # 1. 尝试清理 <think>...</think> 标签 (DeepSeek R1 特有)
+    # R1 经常把思考过程放在 <think> 标签里，我们需要去掉它，只留后面的 JSON
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+    try:
+        # 2. 尝试直接解析
+        return json.loads(text)
+    except:
+        pass
+
+    try:
+        # 3. 清理 markdown ```json ... ```
+        clean_text = text.replace('```json', '').replace('```', '').strip()
+        return json.loads(clean_text)
+    except:
+        pass
+
+    try:
+        # 4. 正则暴力搜索 {...}
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            json_str = match.group()
+            return json.loads(json_str)
+    except:
+        pass
+
+    print(f"❌ [JSON解析失败] AI 最终文本:\n{text[:500]}...")  # 只打印前500字
+    return None
+
+
+# ==========================================
+# 3. Gemini 实现
+# ==========================================
+class GeminiProvider(StrategyInterface):
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            raise ValueError("❌ [配置错误] 未找到 GEMINI_API_KEY")
+            raise ValueError("未找到 GEMINI_API_KEY")
 
-        # 动态读取版本
-        self.model_name = os.getenv("GEMINI_MODEL") or os.getenv("STRATEGY_MODEL") or "gemini-2.5-flash"
-
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(self.model_name)
-        print(f"🧠 [底层加载] Google Gemini (版本: {self.model_name})")
+        print(f"🧠 [加载模型] Google Gemini ({self.model_name})")
 
-    def analyze(self, market_data):
-        prompt = self._build_prompt(market_data)
+    def analyze(self, market_data, news_context=""):
+        prompt = self._build_prompt(market_data, news_context)
         try:
             response = self.model.generate_content(prompt)
-            return self._parse_response(response.text)
+            result = extract_json(response.text)
+            return result if result else {"action": "HOLD", "reason": "Gemini Parse Error"}
         except Exception as e:
             print(f"⚠️ Gemini 思考出错: {e}")
             return {"action": "HOLD", "reason": "Gemini Error"}
 
-    def _build_prompt(self, market_data):
+    def _build_prompt(self, market_data, news_context):
+        price = market_data['current_price']
+        ema_long = market_data['ema']['long']
+        trend = "BULLISH" if price > ema_long else "BEARISH"
+
         return f"""
-        Analyze BTC/USDT data.
-        Price: {market_data['current_price']}
-        RSI: {market_data['rsi']}
-        MACD: {market_data['macd']}
-        Bollinger: {market_data['bollinger']['upper']} / {market_data['bollinger']['lower']}
+        Act as a professional crypto quantitative analyst. 
+        Combine Technical Analysis (Data) with Sentiment Analysis (News) to make a trading decision for BTC/USDT.
+
+        === 1. Market Sentiment (News) ===
+        {news_context if news_context else "No significant news."}
+
+        === 2. Technical Context ===
+        - Price: {price}
+        - Trend: {trend} (Price vs EMA99)
+        - ATR: {market_data['atr']}
+        - OBV: {market_data['obv']}
+
+        === 3. Indicators ===
+        - RSI: {market_data['rsi']}
+        - MACD: {market_data['macd']} (Signal: {market_data['macd_signal']})
+        - Bollinger: Up {market_data['bollinger']['upper']} / Low {market_data['bollinger']['lower']}
+
+        === 4. Decision Logic ===
+        - BUY: Strong Uptrend + Good News + RSI < 70.
+        - SELL: Downtrend + Bad News OR Indicator breakdown.
+        - HOLD: Conflicting signals.
 
         Output JSON strictly:
-        {{"action": "BUY" or "SELL" or "HOLD", "reason": "Reason < 15 words"}}
+        {{"action": "BUY" or "SELL" or "HOLD", "reason": "Reason < 20 words"}}
         """
 
-    def _parse_response(self, text):
-        try:
-            clean_text = text.replace('```json', '').replace('```', '').strip()
-            return json.loads(clean_text)
-        except:
-            return {"action": "HOLD", "reason": "Parse Error"}
 
-
-class DeepSeekStrategy(StrategyInterface):
-    """DeepSeek 模型 (支持 V3 和 R1 深度思考)"""
-
+# ==========================================
+# 4. DeepSeek 实现 (增强版)
+# ==========================================
+class DeepSeekProvider(StrategyInterface):
     def __init__(self):
         api_key = os.getenv("DEEPSEEK_API_KEY")
         base_url = os.getenv("DEEPSEEK_BASE_URL")
 
-        if not api_key or not base_url:
-            raise ValueError("❌ [配置错误] DeepSeek 配置缺失")
+        if not api_key:
+            self.client = None
+            print("⚠️ 未配置 DeepSeek Key")
+        else:
+            self.model_name = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-        self.model_name = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+            # 代理配置 (httpx 兼容性修复)
+            proxy_port = os.getenv("PROXY_PORT")
+            http_client = None
 
-        # [修改 1] 设置更长的超时时间 (60秒)，给 R1 思考的时间
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=60.0
-        )
-        print(f"🧠 [底层加载] DeepSeek (版本: {self.model_name})")
+            if proxy_port:
+                proxy_url = f"http://127.0.0.1:{proxy_port.strip()}"
+                try:
+                    http_client = httpx.Client(proxy=proxy_url)
+                except TypeError:
+                    http_client = httpx.Client(proxies=proxy_url)
+                print(f"🌍 [DeepSeek] 使用代理通道: {proxy_url}")
 
-    def analyze(self, market_data):
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=90.0,  # 增加超时时间，R1 思考很慢
+                http_client=http_client
+            )
+            print(f"🧠 [加载模型] DeepSeek ({self.model_name})")
+
+    def analyze(self, market_data, news_context=""):
+        if not self.client:
+            return {"action": "HOLD", "reason": "DeepSeek Not Configured"}
+
+        # Prompt
         prompt = f"""
-        Analyze BTC/USDT technical indicators.
-        Current Price: {market_data['current_price']}
-        RSI (14): {market_data['rsi']}
+        Analyze BTC/USDT.
+        News: {news_context[:200]}...
+        Price: {market_data['current_price']}
+        Trend (EMA99): {market_data['ema']['long']}
+        RSI: {market_data['rsi']}
         MACD: {market_data['macd']}
-        Bollinger Bands: Upper {market_data['bollinger']['upper']}, Lower {market_data['bollinger']['lower']}
+        ATR: {market_data['atr']}
 
-        Logic:
-        1. RSI > 70 is overbought (Sell risk), RSI < 30 is oversold (Buy opp).
-        2. Price breaking Upper Band suggests pullback.
-
-        Output JSON strictly (no markdown):
+        Output JSON strictly:
         {{"action": "BUY" or "SELL" or "HOLD", "reason": "Brief reason"}}
         """
+
         try:
+            # 🔥 [关键修改] 增加 max_tokens 防止 R1 思考被截断
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": "You are a professional crypto trader. Output JSON only."},
+                    {"role": "system", "content": "You are a trading bot. Output JSON only."},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                # [修改 2] R1 需要更大的 token 空间来存放思考过程和结果
-                max_tokens=2000
+                max_tokens=4000  # 从 500 增加到 4000，给 R1 留足思考空间
             )
 
             message = response.choices[0].message
-
-            # === 尝试捕获深度思考 ===
-            # 注意：官方 SDK 有时把 reasoning 放在 extra_fields 里
-            reasoning = getattr(message, 'reasoning_content', None)
-            # 如果上面拿不到，尝试从 dict 里拿 (防备 SDK 版本差异)
-            if not reasoning and hasattr(message, 'model_dump'):
-                reasoning = message.model_dump().get('reasoning_content')
-
-            if reasoning:
-                print("\n" + "=" * 20 + " 🤔 深度思考中 " + "=" * 20)
-                print(f"\033[90m{reasoning.strip()}\033[0m")
-                print("=" * 55 + "\n")
-
             content = message.content
-            # 清洗一下返回内容，防止 R1 啰嗦
-            clean_text = content.replace('```json', '').replace('```', '').strip()
 
-            # 这里的 log 可以帮你看到它到底回复了什么（有时候它回了非 JSON 格式的话）
-            # print(f"🔍 R1 原始回复: {clean_text}")
+            # === 🔍 深度调试：如果内容为空，打印原始对象 ===
+            if not content:
+                print(f"⚠️ [DeepSeek] 返回内容为空！")
+                # 尝试打印 reasoning_content (如果是 R1)
+                if hasattr(message, 'reasoning_content'):
+                    print(f"🤔 思考过程(Reasoning): {message.reasoning_content[:100]}...")
+                return {"action": "HOLD", "reason": "DeepSeek Empty Response"}
 
-            return json.loads(clean_text)
+            # 提取 JSON
+            result = extract_json(content)
+
+            if result:
+                return result
+            else:
+                return {"action": "HOLD", "reason": "DeepSeek JSON Invalid"}
 
         except Exception as e:
-            # [修改 3] 打印最关键的错误详情！
-            print(f"⚠️ DeepSeek 详细报错: {str(e)}")
-            return {"action": "HOLD", "reason": f"DeepSeek Error: {str(e)[:20]}..."}
+            print(f"⚠️ DeepSeek 运行报错: {str(e)}")
+            return {"action": "HOLD", "reason": "DeepSeek Error"}
 
 
 # ==========================================
-# 3. 策略工厂与通用入口 (Factory & Entry)
+# 5. 策略工厂
 # ==========================================
-def ModelFactory():
-    """根据 .env 配置，生产出对应的模型实例"""
-    provider = os.getenv("AI_PROVIDER", "GEMINI").upper()
-
-    if provider == "DEEPSEEK":
-        return DeepSeekStrategy()
-    elif provider == "GEMINI":
-        return GeminiStrategy()
-    else:
-        print(f"⚠️ 未知提供商 {provider}, 默认回退至 Gemini")
-        return GeminiStrategy()
-
-
 class AIStrategy:
-    """
-    【通用 AI 策略入口】
-    Main 程序只和这个类交互，不用关心底层是 Gemini 还是 DeepSeek。
-    """
-
     def __init__(self):
-        # 初始化时，通过工厂决定实例化哪一个大脑
-        self.brain = ModelFactory()
+        provider = os.getenv("AI_PROVIDER", "GEMINI").upper()
+        if provider == "DEEPSEEK":
+            self.brain = DeepSeekProvider()
+        else:
+            self.brain = GeminiProvider()
 
-    def analyze(self, market_data):
-        # 委托给具体的大脑去分析
-        return self.brain.analyze(market_data)
+    def analyze(self, market_data, news_context=""):
+        return self.brain.analyze(market_data, news_context)

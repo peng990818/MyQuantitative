@@ -1,14 +1,15 @@
 import os
 import time
 import schedule
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # 加载配置
 load_dotenv(override=True)
 
 # ==========================================
-# 0. 网络连接修复 (针对家庭宽带/Mac M系列)
+# 0. 网络连接修复
 # ==========================================
 import socket
 import urllib3
@@ -17,22 +18,24 @@ orig_getaddrinfo = socket.getaddrinfo
 
 
 def forced_ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    # 强制使用 IPv4 (AF_INET)，解决部分梯子在 IPv6 下连不上 OKX 的问题
     return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
 
 
 socket.getaddrinfo = forced_ipv4_getaddrinfo
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-# ==========================================
 
+# ==========================================
+# 引入模块
+# ==========================================
 from trading_engine import OKXDemoTrader, OKXRealTrader
 from model import AIStrategy
 from tracker import AssetManager
+from news_loader import NewsFetcher
 
 # === 全局配置 ===
-RUN_MODE = "DEMO"  # 模拟盘: DEMO | 实盘: REAL
+RUN_MODE = "DEMO"
 SYMBOL = "BTC/USDT"
-TRADE_QTY = 0.0001  # 每次交易数量
+TRADE_QTY = 0.0001
 
 
 class QuantBotCommander:
@@ -40,155 +43,185 @@ class QuantBotCommander:
         self.mode = mode.upper()
         self.symbol = symbol
         self.qty = qty
+        self.start_time = datetime.now()  # 记录启动时间
 
-        print("-" * 50)
-        print(f"🚀 量化机器人启动初始化...")
+        print("=" * 60)
+        print(f"🚀 量化机器人 [V3极速版 | 1分钟轮询] 正在初始化...")
+        print("=" * 60)
 
         # 1. 初始化交易接口
         if self.mode == "REAL":
-            print(f"⚠️ [实盘模式] 资金实盘交易中，请注意风险！")
+            print(f"⚠️ [实盘模式] 资金实盘操作中，请注意风险！")
             self.trader = OKXRealTrader()
         else:
-            print(f"🛠️ [模拟模式] 使用模拟资金测试")
+            print(f"🛠️ [模拟模式] 使用测试资金")
             self.trader = OKXDemoTrader()
 
-        # 2. 初始化 AI 策略
-        # [修改] 显式实例化通用 AI 策略类
-        # 这个类内部会自己去查 .env 决定用 Gemini 还是 DeepSeek
-        print(f"🧠 [AI 系统] 正在加载智能策略模块...")
+        # 2. 初始化 AI
+        print(f"🧠 [AI 大脑] 加载策略模型...")
         self.strategy = AIStrategy()
 
-        # 3. 初始化账本
+        # 3. 初始化新闻
+        print(f"📰 [情报网] 连接 CryptoPanic V2...")
+        self.news_fetcher = NewsFetcher()
+        if not self.news_fetcher.test_connection():
+            print("⚠️ 代理连接失败，新闻模块将降级或失效")
+
+        # 4. 初始化账本
         self.tracker = AssetManager(name=symbol)
-        print("-" * 50)
+
+        # 5. 🔥 [新增] 锁定初始资金快照 🔥
+        print("-" * 30)
+        self.initial_assets = self._get_total_asset_valuation(print_log=True, label="初始资金")
+        print("-" * 30)
+        print("✅ 系统就绪，等待定投任务...")
+
+    def _get_total_asset_valuation(self, print_log=False, label="当前资产"):
+        """
+        计算账户总估值 = USDT余额 + (BTC持仓 * 当前市价)
+        """
+        try:
+            # 1. 获取余额
+            balance = self.trader.get_account_balance()
+            usdt_bal = balance.get('USDT', 0)
+            btc_bal = balance.get('BTC', 0)
+
+            # 2. 获取最新价格用于折算
+            ticker = self.trader.exchange.fetch_ticker(self.symbol)
+            current_price = ticker['last']
+
+            # 3. 计算总值
+            total_value_usdt = usdt_bal + (btc_bal * current_price)
+
+            if print_log:
+                print(f"💰 [{label}]")
+                print(f"   💵 USDT余额: {usdt_bal:.2f} U")
+                print(f"   🪙 BTC 持仓: {btc_bal:.8f} (≈ {btc_bal * current_price:.2f} U)")
+                print(f"   💎 总净值  : {total_value_usdt:.2f} U (按市价 {current_price:.2f})")
+
+            return total_value_usdt
+
+        except Exception as e:
+            print(f"⚠️ 资产估值计算失败: {e}")
+            return 0
+
+    def print_final_report(self):
+        """
+        🔥 [新增] 停止程序时打印的战报
+        """
+        print("\n" + "=" * 60)
+        print(f"🛑 程序停止 | 生成最终盈亏报告")
+        print("=" * 60)
+
+        end_assets = self._get_total_asset_valuation(print_log=True, label="最终资产")
+
+        # 计算盈亏
+        pnl = end_assets - self.initial_assets
+        roi = (pnl / self.initial_assets) * 100 if self.initial_assets > 0 else 0
+
+        # 计算运行时长
+        duration = datetime.now() - self.start_time
+        # 简单的格式化时长
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration_str = f"{int(hours)}小时 {int(minutes)}分 {int(seconds)}秒"
+
+        print("-" * 30)
+        print(f"⏱️ 运行时长: {duration_str}")
+
+        # 根据盈亏显示不同颜色/图标
+        if pnl >= 0:
+            print(f"📈 累计盈利: +{pnl:.2f} U")
+            print(f"🚀 投资回报率 (ROI): +{roi:.4f}%")
+        else:
+            print(f"📉 累计亏损: {pnl:.2f} U")
+            print(f"🥀 投资回报率 (ROI): {roi:.4f}%")
+        print("=" * 60 + "\n")
 
     def execute_logic(self):
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 扫描市场中...")
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔍 市场扫描 (1min)...")
 
         try:
-            # ============================================
-            # A. 【交易前】资产快照 (Snap A)
-            # ============================================
+            # 1. 资产快照
             balance_before = self.trader.get_account_balance()
             usdt_before = balance_before.get('USDT', 0)
             btc_before = balance_before.get('BTC', 0)
 
-            # ============================================
-            # B. 获取行情 & 同步账本
-            # ============================================
+            # 2. 获取行情
             market_data = self.trader.fetch_market_data(self.symbol)
             if not market_data:
-                print("❌ 无法获取行情，跳过本次循环")
+                print("❌ 无法获取行情")
                 return
 
-            current_price = market_data['current_price']
+            price_t0 = market_data['current_price']
+            self.tracker.sync_holdings(btc_before, price_t0)
 
-            # 强行同步账本持仓 (防止本地记录与交易所不符)
-            self.tracker.sync_holdings(btc_before, current_price)
+            # 趋势判断
+            ema_long = market_data['ema']['long']
+            trend_icon = "🐂 多头" if price_t0 > ema_long else "🐻 空头"
 
-            # 🔥🔥🔥 [新增] 打印技术指标看板 🔥🔥🔥
-            print(f"📊 [行情看板] {self.symbol}")
-            print(f"   💰 现价     : {market_data['current_price']}")
-            print(f"   📉 RSI(14)  : {market_data['rsi']}")
-            print(f"   📊 MACD     : {market_data['macd']}")
-            print(f"   🌭 布林上轨 : {market_data['bollinger']['upper']}")
-            print(f"   🌭 布林下轨 : {market_data['bollinger']['lower']}")
-            print("-" * 30)
+            # 技术看板
+            print(f"📊 {self.symbol} | {trend_icon} | 现价: {price_t0:.2f}")
+            print(f"   🌊 OBV:{market_data['obv']:.0f} | ATR:{market_data['atr']:.2f} | RSI:{market_data['rsi']:.1f}")
 
-            # ============================================
-            # C. AI 决策 (Gemini 或 DeepSeek)
-            # ============================================
-            decision = self.strategy.analyze(market_data)
+            # 3. 获取新闻
+            news_text = self.news_fetcher.get_latest_news(self.symbol)
+            if news_text and "No news" not in news_text:
+                print(f"🗞️ [新闻摘要] {news_text[:100]}...")
+
+            # 4. AI 决策 (含耗时监控)
+            print("⏳ AI思考中...", end="", flush=True)
+            t_start = time.time()
+            decision = self.strategy.analyze(market_data, news_context=news_text)
+            ai_duration = time.time() - t_start
+            print(f" Done ({ai_duration:.2f}s)")
+
             action = decision.get("action", "HOLD")
             reason = decision.get("reason", "N/A")
+            print(f"🤖 指令: {action} | 💡 原因: {reason}")
 
-            print(f"🤖 AI信号: {action} | 原因: {reason}")
-            print(f"💵 当前资金: {usdt_before:.2f} U | 持仓: {btc_before:.8f} BTC")
-
-            # ============================================
-            # D. 执行交易
-            # ============================================
-            trade_executed = False  # 标记本次是否真的开了单
-
+            # 5. 执行交易
             if action == "BUY":
-                cost_estimate = current_price * self.qty
-                if usdt_before < cost_estimate:
-                    print(f"⚠️ 余额不足 ({usdt_before:.2f} < {cost_estimate:.2f})，无法买入")
+                cost_estimate = price_t0 * self.qty
+                if usdt_before >= cost_estimate:
+                    print(f"🟢 买入 {self.qty} BTC...")
+                    self.trader.exchange.create_market_order(self.symbol, 'buy', self.qty)
+                    # 简单模拟成交后续处理
+                    time.sleep(1)
+                    # 重新获取一次余额以确认扣款
+                    self._get_total_asset_valuation(print_log=False)
                 else:
-                    print(f"🟢 执行买入: {self.qty} BTC ...")
-                    order = self.trader.exchange.create_market_order(self.symbol, 'buy', self.qty)
-                    if order:
-                        trade_executed = True
-                        # 记账 (为了 Tracker 报表)
-                        fee = order.get('fee', {}).get('cost', 0) if order.get('fee') else 0
-                        exec_price = order.get('average') or current_price
-                        self.tracker.buy(exec_price, order['amount'], fee)
+                    print(f"⚠️ 余额不足")
 
             elif action == "SELL":
-                if btc_before > 0:
-                    # 如果余额很少(小于交易量)，就清仓；否则卖固定量
-                    sell_amt = self.qty if btc_before > self.qty else float(btc_before)
-                    print(f"🔴 执行卖出: {sell_amt:.8f} BTC ...")
-
-                    order = self.trader.exchange.create_market_order(self.symbol, 'sell', sell_amt)
-                    if order:
-                        trade_executed = True
-                        # 记账
-                        fee = order.get('fee', {}).get('cost', 0) if order.get('fee') else 0
-                        exec_price = order.get('average') or current_price
-                        self.tracker.sell(exec_price, order['amount'], fee)
+                if btc_before > 0.000001:
+                    sell_amt = btc_before if btc_before < self.qty else self.qty
+                    print(f"🔴 卖出 {sell_amt:.6f} BTC...")
+                    self.trader.exchange.create_market_order(self.symbol, 'sell', sell_amt)
+                    time.sleep(1)
                 else:
-                    print("⚠️ 无持仓，无法卖出")
-
-            # ============================================
-            # E. 【交易后】资金流结算 (Snap B - Snap A)
-            # ============================================
-            if trade_executed:
-                print("⏳ 等待交易所结算 (1秒)...")
-                time.sleep(1)  # 给交易所一点时间刷新余额
-
-                balance_after = self.trader.get_account_balance()
-                usdt_after = balance_after.get('USDT', 0)
-                btc_after = balance_after.get('BTC', 0)
-
-                # 计算变动
-                usdt_change = usdt_after - usdt_before
-                btc_change = btc_after - btc_before
-
-                print("=" * 45)
-                if usdt_change > 0:
-                    print(f"💰 [资金回笼] 卖出成功！")
-                    print(f"   USDT 变动: +{usdt_change:.4f} U")
-                    print(f"   BTC  变动: {btc_change:.8f}")
-                else:
-                    print(f"💸 [资金支出] 买入成功！")
-                    print(f"   USDT 变动: {usdt_change:.4f} U")
-                    print(f"   BTC  变动: +{btc_change:.8f}")
-                print(f"🧾 最新余额: {usdt_after:.2f} U")
-                print("=" * 45)
-
-            # ============================================
-            # F. 生成持仓报表 (即使 HOLD 也显示，心里有底)
-            # ============================================
-            self.tracker.report(current_price)
+                    print("⚠️ 无持仓")
 
         except Exception as e:
-            import traceback
-            # 打印详细错误，方便你排查 DeepSeek 此时是否连得上
             print(f"❌ 运行异常: {e}")
-            # traceback.print_exc()
 
     def start(self):
-        # 启动时先跑一次
+        # 先执行一次
         self.execute_logic()
 
-        # 每 1 分钟执行一次
+        # 🔥 [修改] 改为 1 分钟轮询 🔥
         schedule.every(1).minutes.do(self.execute_logic)
 
-        print(f"✅ 计划任务已启动，按 Ctrl+C 停止")
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
+        print(f"✅ 任务已启动，按 Ctrl+C 停止并查看战报...")
+
+        # 🔥 [新增] 捕获 Ctrl+C 以打印战报 🔥
+        try:
+            while True:
+                schedule.run_pending()
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.print_final_report()
+            sys.exit(0)
 
 
 if __name__ == "__main__":
