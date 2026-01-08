@@ -16,14 +16,12 @@ load_dotenv(override=True)
 
 # ... (保留原本的 OKXTraderBase 类不动) ...
 class OKXTraderBase:
-    # ... (原有代码保持不变) ...
     def __init__(self, is_demo=True):
         self.is_demo = is_demo
         self.exchange = None
         self._init_exchange()
 
     def _init_exchange(self):
-        # ... (原有代码保持不变) ...
         # 注意：这里我们依然需要连接交易所来获取行情
         if self.is_demo:
             api_key = os.getenv("OKX_DEMO_API_KEY")
@@ -34,25 +32,37 @@ class OKXTraderBase:
             secret = os.getenv("OKX_REAL_SECRET")
             password = os.getenv("OKX_REAL_PASSWORD")
 
-        proxy_port = os.getenv("PROXY_PORT", "7890")
+        # 🔥 [修改] 默认值设为空字符串，实现智能代理
+        proxy_port = os.getenv("PROXY_PORT", "")
 
         exchange_config = {
             'apiKey': api_key,
             'secret': secret,
             'password': password,
             'enableRateLimit': True,
+
+            # 🔥 [优化] 增大超时时间到 30秒，防止网络抖动报错
+            'timeout': 30000,
+
             'options': {'defaultType': 'swap'},
-            'proxies': {
+        }
+
+        # 🔥 [新增] 智能判断：只有当配置了端口时，才加上代理
+        if proxy_port:
+            exchange_config['proxies'] = {
                 'http': f'http://127.0.0.1:{proxy_port}',
                 'https': f'http://127.0.0.1:{proxy_port}',
             }
-        }
+            print(f"🌍 [OKX] 使用代理连接: 127.0.0.1:{proxy_port}")
+        else:
+            print("🚀 [OKX] 检测到无代理配置，使用直连模式 (Direct Connection)")
+
         self.exchange = ccxt.okx(exchange_config)
+
         # PaperTrader 不需要 sandbox，因为它只读行情，不交易
         if self.is_demo and not isinstance(self, OKXPaperTrader):
             self.exchange.set_sandbox_mode(True)
 
-    # ... (get_account_balance, fetch_market_data 等原有方法保持不变) ...
     def get_account_balance(self):
         try:
             balance = self.exchange.fetch_balance()
@@ -63,11 +73,26 @@ class OKXTraderBase:
             print(f"❌ 获取余额失败: {e}")
             return {'USDT': 0, 'BTC': 0}
 
-    def fetch_market_data(self, symbol, timeframe='1h', limit=100):  # 注意默认改为 1h
-        try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    def fetch_market_data(self, symbol, timeframe='1h', limit=100):
+        # 🔥 [新增] 失败重试机制
+        max_retries = 3
+        df = None
 
+        for attempt in range(max_retries):
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                # 如果成功获取，跳出重试循环
+                break
+            except Exception as e:
+                print(f"⚠️ [第 {attempt + 1} 次] 获取行情失败: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(3)  # 等待 3 秒后重试
+                else:
+                    print("❌ 重试多次无效，放弃本次扫描。")
+                    return None
+
+        try:
             # 强制转换 float
             numeric_cols = ['open', 'high', 'low', 'close', 'volume']
             for col in numeric_cols:
@@ -140,9 +165,7 @@ class OKXTraderBase:
                 'macd_signal': float(latest['macd_signal'])
             }
         except Exception as e:
-            print(f"❌ 获取行情失败: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ 数据处理异常: {e}")
             return None
 
 
@@ -165,16 +188,27 @@ class OKXPaperTrader(OKXTraderBase):
         # 我们这里传 is_demo=True 仅仅为了初始化，后面我们会覆盖 create_order
         super().__init__(is_demo=True)
 
-        # 覆盖 exchange 连接，强制使用实盘 API (只读) 获取真实数据
-        # 这样你就不用担心模拟盘 K 线不一样了
-        self.exchange = ccxt.okx({
+        # 🔥 [修改] 读取端口，默认为空
+        proxy_port = os.getenv("PROXY_PORT", "")
+
+        # 基础配置
+        paper_config = {
             'enableRateLimit': True,
-            'proxies': {
-                'http': f'http://127.0.0.1:{os.getenv("PROXY_PORT", "7890")}',
-                'https': f'http://127.0.0.1:{os.getenv("PROXY_PORT", "7890")}',
+            # 🔥 [优化] 同样加上超时设置
+            'timeout': 30000,
+        }
+
+        # 🔥 [新增] 只有有端口时才加代理
+        if proxy_port:
+            paper_config['proxies'] = {
+                'http': f'http://127.0.0.1:{proxy_port}',
+                'https': f'http://127.0.0.1:{proxy_port}',
             }
-        })
-        print("📝 [模拟实盘] 已连接 OKX 实盘行情接口 (只读)")
+            print(f"📝 [模拟实盘] 使用代理连接实盘行情")
+        else:
+            print(f"📝 [模拟实盘] 直连模式连接实盘行情")
+
+        self.exchange = ccxt.okx(paper_config)
 
         self.balance_file = "paper_balance.json"
         self.commission_rate = 0.001  # 0.1% 手续费
@@ -204,7 +238,9 @@ class OKXPaperTrader(OKXTraderBase):
         # 模拟滑点 (买入稍微贵一点，卖出稍微便宜一点)
         slippage = 0.0002  # 0.02% 随机滑点
         import random
-        real_price = price * (1 + slippage) if side == 'buy' else price * (1 - slippage)
+        # 简单的随机正负滑点模拟
+        real_slippage = random.uniform(-slippage, slippage)
+        real_price = price * (1 + real_slippage)
 
         cost = qty * real_price
         fee = cost * self.commission_rate
