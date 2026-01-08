@@ -1,18 +1,26 @@
-name: quant
+name: quant            # 🔥 保持原名
 channels:
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
-  - pandas
-  - "numpy<2"      # 保持锁定，防止新版 Numpy 不兼容 pandas_ta
   - pip
-  - pandas-ta
+
+  # === 核心计算与绘图 (Conda) ===
+  - pandas
+  - "numpy<2.0.0"      # 🔒 锁死版本，防止 pandas-ta 报错
+  - matplotlib         # 📊 [新增] v2.0 回测绘图必备
+  - pyyaml             # ⚙️ [新增] 解析 config.yaml 必备
+
+  # === 扩展库 (Pip) ===
   - pip:
-      - ccxt                # 交易核心
-      - python-dotenv       # 管理 .env (必须有)
-      - pysocks             # M4 芯片代理支持 (必须有)
-      - google-generativeai # [新增] Gemini AI 的官方 SDK
-      - schedule            # [新增] 用于每分钟执行一次任务
-      - requests            # [新增] 基础网络请求库
-      - openai
+      - pandas-ta           # 技术指标
+      - ccxt                # 交易所接口
+      - python-dotenv       # 环境变量
+      - requests            # 网络请求
+      - pysocks             # 代理支持
+      - schedule            # 定时任务
+
+      # === AI 模型支持 ===
+      - openai              # DeepSeek / OpenAI
+      - google-generativeai # Gemini
