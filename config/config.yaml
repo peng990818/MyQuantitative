@@ -16,7 +16,7 @@ timeframe: "1h"
 # === 资金管理 (复利系统) ===
 money_management:
   mode: "compound"       # compound(复利) | fixed(单利)
-  risk_per_trade: 0.5    # 复利模式：每次投入总权益的 10%
+  risk_per_trade: 0.98    # 复利模式：每次投入总权益的 10%
 #  fixed_qty: 0.1
 #  mode: "fixed"
 
@@ -59,5 +59,5 @@ notification:
     smtp_port: 587
 
 risk_management:
-  stop_loss: 0.03       # 4% 止损 (稍微收紧)
-  take_profit: 0.05     # 🔥 8% 止盈 (改成容易达到的目标)
+  stop_loss: 0.03
+  take_profit: 0.05

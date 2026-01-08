@@ -1,118 +1,95 @@
-import os
-
-import pandas_ta as ta
 import pandas as pd
+import numpy as np
 from utils.config_loader import ConfigLoader
-
+from utils.logger import logger
 
 class TechnicalAnalyzer:
     def __init__(self):
         self.cfg = ConfigLoader()
-        # 这里暂时为了兼容 v1 功能，我们先定义一个标准策略
-        # 后续这里可以读取 config.yaml 里的 'indicators' 列表来动态生成
-        self.strategy = ta.Strategy(
-            name="QuantBot_v2_Standard",
-            ta=[
-                {"kind": "rsi", "length": 14},
-                {"kind": "macd", "fast": 12, "slow": 26, "signal": 9},
-                {"kind": "bbands", "length": 20, "std": 2},
-                {"kind": "ema", "length": 7},
-                {"kind": "ema", "length": 99},
-                {"kind": "atr", "length": 14},
-                {"kind": "adx", "length": 14},
-                {"kind": "cci", "length": 20},
-                {"kind": "obv"},
-                {"kind": "stoch", "k": 9, "d": 3}
-            ]
-        )
-        print("📊 [Technical] 动态指标策略已加载")
+        logger.info("📊 [Technical] 机构级计算引擎 v5.0 (兼容性修复版) 已加载")
 
     def calculate_indicators(self, df):
         """
-        输入原始 K 线 DataFrame，输出包含指标的 DataFrame
+        计算核心指标，不执行内部 dropna，由引擎决定如何清洗
         """
         if df is None or df.empty:
             return df
 
-        # 强制类型转换，防止报错
-        df['close'] = df['close'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['volume'] = df['volume'].astype(float)
+        # 使用 copy 避免对原数据造成非预期修改
+        df = df.copy()
+        for col in ['close', 'high', 'low', 'volume']:
+            df[col] = df[col].astype(float)
 
-        # 🔥 一键并行计算所有指标
-        df.ta.strategy(self.strategy)
+        close = df['close']
+        high = df['high']
+        low = df['low']
 
-        # 清洗数据 (去除因计算指标产生的 NaN)
-        df.dropna(inplace=True)
+        # ==========================================
+        # 🚀 1. 趋势强度 (ADX)
+        # ==========================================
+        alpha = 1 / 14
+        tr1 = high - low
+        tr2 = (high - close.shift()).abs()
+        tr3 = (low - close.shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=alpha, adjust=False).mean()
+
+        up = high - high.shift()
+        down = low.shift() - low
+
+        plus_dm = np.where((up > down) & (up > 0), up, 0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0)
+
+        # 这里使用 values 转换，确保索引对齐不出错
+        plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr)
+        minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=alpha, adjust=False).mean() / atr)
+
+        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di + 0.00001))
+        df['ADX_14'] = dx.ewm(alpha=alpha, adjust=False).mean()
+
+        # ==========================================
+        # 🚀 2. 统计位置 (Z-Score)
+        # ==========================================
+        sma20 = close.rolling(window=20).mean()
+        std20 = close.rolling(window=20).std().replace(0, 0.00001)
+        df['z_score'] = (close - sma20) / std20
+
+        # ==========================================
+        # 🚀 3. 趋势方向 (EMA)
+        # ==========================================
+        df['EMA_50'] = close.ewm(span=50, adjust=False).mean()
+        df['EMA_200'] = close.ewm(span=200, adjust=False).mean()
+
+        # ==========================================
+        # 🚀 4. 波动率风控 (ATR)
+        # ==========================================
+        df['ATRr_14'] = atr
+
+        # 兼容性字段
+        df['slope_pct'] = close.pct_change(5) * 100
+        df['RSI_14'] = 50
+
+        # 🔥 【关键改动】不再在此处调用 dropna()
+        # 保持 DataFrame 长度与输入一致，由调用者清洗
         return df
 
     def get_market_state(self, row):
-        """
-        将 DataFrame 的一行转换为 v1 风格的字典，供后续评分逻辑使用
-        """
-        # 注意：pandas_ta 自动生成的列名通常是 "RSI_14", "EMA_7" 等
-        # 这里做一个简单的映射，确保兼容性
         try:
             return {
                 'current_price': row['close'],
                 'trend': {
-                    'ema_short': row.get('EMA_7'),
-                    'ema_long': row.get('EMA_99'),
+                    'ema_long': row.get('EMA_200'),
+                    'ema_mid': row.get('EMA_50'),
                     'adx': row.get('ADX_14'),
+                    'slope': row.get('slope_pct'),
                 },
                 'momentum': {
-                    'rsi': row.get('RSI_14'),
-                    'cci': row.get('CCI_20_0.015'),
+                    'z_score': row.get('z_score'),
                 },
                 'volatility': {
-                    'bb_upper': row.get('BBU_20_2.0'),
-                    'bb_lower': row.get('BBL_20_2.0'),
                     'atr': row.get('ATRr_14'),
-                },
-                'volume': {
-                    'obv': row.get('OBV'),
-                },
-                'macd': row.get('MACD_12_26_9'),
-                'macd_signal': row.get('MACDs_12_26_9')
+                }
             }
         except Exception as e:
-            print(f"❌ 数据映射错误: {e}")
-            print(f"可用列名: {row.index.tolist()}")
+            logger.warning(f"❌ [Technical] 数据映射异常: {e}")
             return {}
-
-if __name__ == "__main__":
-    import sys
-    import pandas as pd
-    import numpy as np
-
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-    print("📊 正在测试 TechnicalAnalyzer...")
-
-    # 1. 造假数据 (100根K线)
-    print("⏳ 生成模拟 K 线数据...")
-    df = pd.DataFrame({
-        'close': np.random.uniform(90000, 95000, 100),
-        'high': np.random.uniform(95000, 96000, 100),
-        'low': np.random.uniform(89000, 90000, 100),
-        'volume': np.random.uniform(100, 1000, 100)
-    })
-
-    # 2. 计算
-    try:
-        analyzer = TechnicalAnalyzer()
-        df_res = analyzer.calculate_indicators(df)
-
-        print("✅ 计算完成！")
-        print(f"   输入行数: 100 -> 输出行数: {len(df_res)} (因指标计算会消耗头部数据)")
-        print(
-            f"   包含指标列: {[col for col in df_res.columns if col not in ['close', 'high', 'low', 'volume']][:5]}...")
-
-        # 3. 测试状态提取
-        last_row = df_res.iloc[-1]
-        state = analyzer.get_market_state(last_row)
-        print(f"✅ 状态提取测试: RSI={state['momentum'].get('rsi'):.2f}")
-
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")

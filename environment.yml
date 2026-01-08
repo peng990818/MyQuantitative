@@ -7,14 +7,13 @@ dependencies:
   - pip
 
   # === 核心计算与绘图 (Conda) ===
-  - pandas
+  - pandas<2.0.0
   - "numpy<2.0.0"      # 🔒 锁死版本，防止 pandas-ta 报错
   - matplotlib         # 📊 [新增] v2.0 回测绘图必备
   - pyyaml             # ⚙️ [新增] 解析 config.yaml 必备
 
   # === 扩展库 (Pip) ===
   - pip:
-      - pandas-ta           # 技术指标
       - ccxt                # 交易所接口
       - python-dotenv       # 环境变量
       - requests            # 网络请求

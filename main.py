@@ -18,7 +18,7 @@ from core.engine import TradingEngine
 
 def main():
     logger.info("==========================================")
-    logger.info("🤖 QuantBot v2.0 - 启动 (固定仓位版)")
+    logger.info("🤖 QuantBot v2.0 - 启动")
     logger.info("==========================================")
 
     try:
