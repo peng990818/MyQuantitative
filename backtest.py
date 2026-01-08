@@ -31,15 +31,26 @@ class RiskBacktester:
 
         self.engine = MultiFactorEngine()
 
-        # 代理配置
-        proxy_port = os.getenv("PROXY_PORT", "7890")
-        self.exchange = ccxt.okx({
+        # 🔥 [修改] 读取端口，默认为空，实现智能代理
+        proxy_port = os.getenv("PROXY_PORT", "")
+
+        exchange_config = {
+            # 🔥 [优化] 保持 30秒超时
             'timeout': 30000,
-            'proxies': {
+            # ❌ 删除写死的 proxies
+        }
+
+        # 🔥 [新增] 智能判断：只有当配置了端口时，才加上代理
+        if proxy_port:
+            exchange_config['proxies'] = {
                 'http': f'http://127.0.0.1:{proxy_port}',
                 'https': f'http://127.0.0.1:{proxy_port}',
             }
-        })
+            print(f"🌍 [回测] 使用代理连接下载数据: {proxy_port}")
+        else:
+            print("🚀 [回测] 使用直连模式下载数据 (Direct Connection)")
+
+        self.exchange = ccxt.okx(exchange_config)
 
         # 账户状态
         self.usdt = self.initial_capital

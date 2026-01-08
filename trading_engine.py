@@ -32,7 +32,8 @@ class OKXTraderBase:
             secret = os.getenv("OKX_REAL_SECRET")
             password = os.getenv("OKX_REAL_PASSWORD")
 
-        proxy_port = os.getenv("PROXY_PORT", "7890")
+        # 🔥 [修改] 默认值设为空字符串，实现智能代理
+        proxy_port = os.getenv("PROXY_PORT", "")
 
         exchange_config = {
             'apiKey': api_key,
@@ -44,11 +45,18 @@ class OKXTraderBase:
             'timeout': 30000,
 
             'options': {'defaultType': 'swap'},
-            'proxies': {
+        }
+
+        # 🔥 [新增] 智能判断：只有当配置了端口时，才加上代理
+        if proxy_port:
+            exchange_config['proxies'] = {
                 'http': f'http://127.0.0.1:{proxy_port}',
                 'https': f'http://127.0.0.1:{proxy_port}',
             }
-        }
+            print(f"🌍 [OKX] 使用代理连接: 127.0.0.1:{proxy_port}")
+        else:
+            print("🚀 [OKX] 检测到无代理配置，使用直连模式 (Direct Connection)")
+
         self.exchange = ccxt.okx(exchange_config)
 
         # PaperTrader 不需要 sandbox，因为它只读行情，不交易
@@ -180,18 +188,27 @@ class OKXPaperTrader(OKXTraderBase):
         # 我们这里传 is_demo=True 仅仅为了初始化，后面我们会覆盖 create_order
         super().__init__(is_demo=True)
 
-        # 覆盖 exchange 连接，强制使用实盘 API (只读) 获取真实数据
-        # 这样你就不用担心模拟盘 K 线不一样了
-        self.exchange = ccxt.okx({
+        # 🔥 [修改] 读取端口，默认为空
+        proxy_port = os.getenv("PROXY_PORT", "")
+
+        # 基础配置
+        paper_config = {
             'enableRateLimit': True,
             # 🔥 [优化] 同样加上超时设置
             'timeout': 30000,
-            'proxies': {
-                'http': f'http://127.0.0.1:{os.getenv("PROXY_PORT", "7890")}',
-                'https': f'http://127.0.0.1:{os.getenv("PROXY_PORT", "7890")}',
+        }
+
+        # 🔥 [新增] 只有有端口时才加代理
+        if proxy_port:
+            paper_config['proxies'] = {
+                'http': f'http://127.0.0.1:{proxy_port}',
+                'https': f'http://127.0.0.1:{proxy_port}',
             }
-        })
-        print("📝 [模拟实盘] 已连接 OKX 实盘行情接口 (只读)")
+            print(f"📝 [模拟实盘] 使用代理连接实盘行情")
+        else:
+            print(f"📝 [模拟实盘] 直连模式连接实盘行情")
+
+        self.exchange = ccxt.okx(paper_config)
 
         self.balance_file = "paper_balance.json"
         self.commission_rate = 0.001  # 0.1% 手续费

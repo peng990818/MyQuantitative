@@ -70,7 +70,14 @@ class PositionManager:
 # ==========================================
 class QuantBotCommander:
     def __init__(self):
+        proxy = os.getenv("PROXY_PORT", "")
+        mode_str = f"🌍 代理模式 ({proxy})" if proxy else "🚀 直连模式"
+        print(f"\n{'=' * 40}")
+        print(f"🤖 量化机器人启动 | {mode_str}")
+        print(f"📈 交易标的: {SYMBOL} | 周期: {TIMEFRAME}")
         print(f"🤖 初始化量化核心 [模式: {RUN_MODE}]...")
+
+        print(f"{'=' * 40}\n")
 
         # 1. 初始化交易执行器
         if RUN_MODE == "REAL":
