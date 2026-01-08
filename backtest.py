@@ -1,356 +1,311 @@
-import ccxt
 import pandas as pd
-import pandas_ta as ta
 import matplotlib.pyplot as plt
-import numpy as np
 import os
-import json
-from datetime import datetime, timedelta
+import sys
 import warnings
-from dotenv import load_dotenv
+from datetime import timedelta
 
-# 加载配置
-load_dotenv(override=True)
+# === 屏蔽警告 & 路径魔法 ===
 warnings.simplefilter(action='ignore', category=FutureWarning)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# 🔥 核心：直接引入你的因子引擎，保证逻辑 100% 同步
-from factor_engine import MultiFactorEngine
+# === 引入 v2.0 核心模块 ===
+from utils.config_loader import ConfigLoader
+from utils.logger import logger
+from modules.market.loader import MarketDataLoader
+from modules.analysis.technical import TechnicalAnalyzer
+from modules.strategy.evaluator import StrategyEvaluator
+from core.position import PositionManager
 
 
-class RiskBacktester:
-    def __init__(self, symbol='BTC/USDT', days=120):
+class BacktestEngine:
+    def __init__(self, symbol="BTC/USDT", days=30):
+        print(f"⏳ 初始化回测引擎 | 标的: {symbol} | 周期: {days}天")
+
+        # 1. 初始化配置加载器
+        self.cfg = ConfigLoader()
+
+        # 🔥 [关键] 注入 BACKTEST 模式 (屏蔽邮件/通知)
+        self.cfg._config['run_mode'] = 'BACKTEST'
+
+        # 2. 🔥 [关键] 加载回测专用策略配置
+        # 不再硬编码，而是从 config.yaml 读取 scoring_backtest 并覆盖默认 scoring
+        bt_scoring = self.cfg.get("scoring_backtest")
+
+        if bt_scoring:
+            print("🔧 [配置] 检测到 scoring_backtest，正在应用回测专用权重...")
+            self.cfg._config['scoring'] = bt_scoring
+            # 打印确认
+            w = bt_scoring.get('weights', {})
+            t = bt_scoring.get('thresholds', {})
+            print(f"   -> 权重: Tech={w.get('technical')} | Trend={w.get('trend')} | AI={w.get('sentiment')}")
+            print(f"   -> 阈值: Buy={t.get('buy')} | Sell={t.get('sell')}")
+        else:
+            print("⚠️ [警告] 未找到 scoring_backtest 配置，将使用默认实盘配置 (可能导致无交易)")
+
         self.symbol = symbol
         self.days = days
-        self.initial_capital = 10000
 
-        # === ⚙️ 核心参数 (必须与 main.py 保持一致) ===
-        self.TIMEFRAME_STRATEGY = '1h'  # 策略周期
-        self.STOP_LOSS_PCT = 0.05  # 止损 5%
-        self.TAKE_PROFIT_PCT = 0.20  # 止盈 20%
-        self.COMMISSION = 0.001  # 手续费 0.1%
+        # 3. 初始化核心模块
+        self.market = MarketDataLoader()
+        self.tech_analyzer = TechnicalAnalyzer()
+        self.evaluator = StrategyEvaluator()
+        self.pos_manager = PositionManager()
 
-        self.engine = MultiFactorEngine()
+        # 4. 账户模拟状态
+        self.initial_balance = 10000.0
+        self.usdt = self.initial_balance
+        self.btc = 0.0
+        self.entry_price = 0.0
 
-        # 🔥 [修改] 读取端口，默认为空，实现智能代理
-        proxy_port = os.getenv("PROXY_PORT", "")
+        # 5. 交易记录
+        self.trades = []
+        self.equity_curve = []
 
-        exchange_config = {
-            # 🔥 [优化] 保持 30秒超时
-            'timeout': 30000,
-            # ❌ 删除写死的 proxies
-        }
+        # 6. 读取风控参数
+        self.stop_loss_pct = self.cfg.get("risk_management.stop_loss", 0.05)
+        self.take_profit_pct = self.cfg.get("risk_management.take_profit", 0.20)
+        self.commission = 0.001
 
-        # 🔥 [新增] 智能判断：只有当配置了端口时，才加上代理
-        if proxy_port:
-            exchange_config['proxies'] = {
-                'http': f'http://127.0.0.1:{proxy_port}',
-                'https': f'http://127.0.0.1:{proxy_port}',
-            }
-            print(f"🌍 [回测] 使用代理连接下载数据: {proxy_port}")
-        else:
-            print("🚀 [回测] 使用直连模式下载数据 (Direct Connection)")
+        print(f"🛡️ 风控参数: SL={self.stop_loss_pct * 100}% | TP={self.take_profit_pct * 100}%")
 
-        self.exchange = ccxt.okx(exchange_config)
-
-        # 账户状态
-        self.usdt = self.initial_capital
-        self.btc = 0
-        self.history = []  # 净值曲线
-        self.trades = []  # 交易记录
-        self.entry_price = 0.0  # 持仓成本
-
-    def fetch_1m_data(self):
+    def fetch_data(self):
         """
-        📥 获取 1m 原子数据
-        这是所有回测的基础，包含了盘中最高价和最低价，用于精确测算止损。
+        获取 1m 高频数据 (循环分页下载) 并合成 1h 数据
         """
+        # 1. 缓存文件路径
         safe_symbol = self.symbol.replace('/', '_')
-        filename = f"data_{safe_symbol}_1m_{self.days}d.csv"
-        file_path = os.path.join(os.getcwd(), filename)
+        cache_file = f"data/backtest_{safe_symbol}_{self.days}d.csv"
+        os.makedirs("data", exist_ok=True)
 
-        if os.path.exists(file_path):
-            print(f"📂 加载本地 1m 基础数据: {filename}")
-            df = pd.read_csv(file_path)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            return df
+        if os.path.exists(cache_file):
+            print(f"📂 加载本地缓存: {cache_file}")
+            df_1m = pd.read_csv(cache_file)
+            df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'])
+        else:
+            print(f"📥 正在下载 {self.days} 天的 1m 数据 (分页下载中)...")
 
-        print(f"📥 正在下载 {self.days} 天的 1m 数据 (数据量较大，请耐心等待)...")
-        limit = 100
-        since = self.exchange.milliseconds() - (self.days * 24 * 60 * 60 * 1000)
-        all_ohlcv = []
+            # === 循环分页下载逻辑 ===
+            all_ohlcv = []
+            since = self.market.exchange.milliseconds() - (self.days * 24 * 60 * 60 * 1000)
+            limit = 100
 
-        while since < self.exchange.milliseconds():
-            try:
-                ohlcv = self.exchange.fetch_ohlcv(self.symbol, '1m', since=since, limit=limit)
-                if not ohlcv: break
-                since = ohlcv[-1][0] + 1
-                all_ohlcv += ohlcv
-                print(f"   已下载 {len(all_ohlcv)} 条...", end="\r")
-            except:
-                break
+            while True:
+                try:
+                    t_str = pd.to_datetime(since, unit='ms')
+                    print(f"   ...下载进度: {t_str}", end="\r")
 
-        print(f"\n✅ 下载完成，共 {len(all_ohlcv)} 条。")
-        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    ohlcv = self.market.exchange.fetch_ohlcv(self.symbol, "1m", since=since, limit=limit)
+                    if not ohlcv: break
 
-        # 保存缓存
-        df.to_csv(file_path, index=False)
-        return df
+                    all_ohlcv += ohlcv
 
-    def _calculate_indicators_1h(self, df_1h):
-        """
-        📐 计算 1H 指标
-        复用之前的计算逻辑，确保 EMA, RSI 等指标是在 1H 级别上计算的。
-        """
+                    # 更新时间：最后一条数据的下一分钟
+                    since = ohlcv[-1][0] + 60000
 
-        # 辅助函数
-        def get_series(res):
-            if isinstance(res, pd.DataFrame): return res.iloc[:, 0]
-            return res
+                    # 停止条件：已经追上当前时间
+                    if since > self.market.exchange.milliseconds(): break
+                    if len(ohlcv) < limit: break  # 数据不足 limit 说明取完了
 
-        try:
-            # 1. 基础
-            df_1h['rsi'] = get_series(df_1h.ta.rsi(length=14))
-            macd = df_1h.ta.macd(fast=12, slow=26, signal=9)
-            if isinstance(macd, pd.DataFrame):
-                df_1h['macd'] = macd.iloc[:, 0]
-                df_1h['macd_signal'] = macd.iloc[:, 2]
-            else:
-                df_1h['macd'] = 0;
-                df_1h['macd_signal'] = 0
+                except Exception as e:
+                    print(f"\n⚠️ 下载中断: {e}")
+                    break
 
-            # 2. 动量
-            kdj = df_1h.ta.stoch(k=9, d=3)
-            if isinstance(kdj, pd.DataFrame):
-                df_1h['kdj_k'] = kdj.iloc[:, 0];
-                df_1h['kdj_d'] = kdj.iloc[:, 1]
-            df_1h['cci'] = get_series(df_1h.ta.cci(length=20))
-            df_1h['willr'] = get_series(df_1h.ta.willr(length=14))
+            print(f"\n✅ 下载完成，共 {len(all_ohlcv)} 条")
 
-            # 3. 趋势
-            adx = df_1h.ta.adx(length=14)
-            if isinstance(adx, pd.DataFrame):
-                df_1h['adx'] = adx.iloc[:, 0];
-                df_1h['dmp'] = adx.iloc[:, 1];
-                df_1h['dmn'] = adx.iloc[:, 2]
+            if not all_ohlcv:
+                raise Exception("❌ 未下载到数据，请检查网络/代理")
 
-            df_1h['ema_7'] = get_series(df_1h.ta.ema(length=7))
-            df_1h['ema_25'] = get_series(df_1h.ta.ema(length=25))
-            df_1h['ema_99'] = get_series(df_1h.ta.ema(length=99))
+            df_1m = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
+            df_1m.to_csv(cache_file, index=False)
 
-            # 4. 波动
-            bb = df_1h.ta.bbands(length=20, std=2)
-            if isinstance(bb, pd.DataFrame):
-                df_1h['bb_lower'] = bb.iloc[:, 0];
-                df_1h['bb_upper'] = bb.iloc[:, 2]
-            df_1h['atr'] = get_series(df_1h.ta.atr(length=14))
-
-            # 5. 资金
-            df_1h['obv'] = get_series(df_1h.ta.obv())
-            df_1h['mfi'] = get_series(df_1h.ta.mfi(length=14))
-            df_1h['cmf'] = get_series(df_1h.ta.cmf(length=20))
-
-            df_1h.dropna(inplace=True)
-            return df_1h
-        except Exception as e:
-            print(f"❌ 指标计算错误: {e}")
-            return pd.DataFrame()
-
-    def _row_to_market_data(self, row):
-        """将 DataFrame 行转为 Engine 需要的格式"""
-        return {
-            'symbol': self.symbol,
-            'current_price': row['close'],
-            'volume': row['volume'],
-            'trend': {
-                'ema_short': row['ema_7'], 'ema_long': row['ema_99'],
-                'adx': row['adx'], 'di_plus': row['dmp'], 'di_minus': row['dmn']
-            },
-            'momentum': {
-                'rsi': row['rsi'], 'cci': row['cci'], 'willr': row['willr'],
-                'kdj_k': row['kdj_k'], 'kdj_d': row['kdj_d']
-            },
-            'volatility': {
-                'atr': row['atr'], 'bb_upper': row['bb_upper'], 'bb_lower': row['bb_lower']
-            },
-            'volume': {
-                'obv': row['obv'], 'mfi': row['mfi'], 'cmf': row['cmf']
-            },
-            'macd': row['macd'], 'macd_signal': row['macd_signal']
-        }
-
-    def run(self):
-        # 1. 获取 1m 数据 (用于风控)
-        df_1m = self.fetch_1m_data()
-        if df_1m.empty: return
-
-        # 2. 合成 1h 数据 (用于策略信号)
-        print("🔄 正在合成 1H 数据并计算策略信号...")
+        # 2. 合成 1H 数据
+        print("🔄 合成 1H 数据...")
         df_1m.set_index('timestamp', inplace=True)
+        df_1h = df_1m.resample('1h').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        }).dropna()
 
-        # Resample 到 1H
-        agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-        df_1h = df_1m.resample('1H').agg(agg_dict).dropna()
+        # 3. 计算指标
+        df_1h = self.tech_analyzer.calculate_indicators(df_1h)
+
+        # 🔥 [关键] 删除预热期 (Warm-up Period)
+        # 刚开始的 ~100 行数据，EMA 是空的，必须删掉，否则后面会报错
+        df_1h.dropna(inplace=True)
+
+        # 恢复索引
+        df_1m.reset_index(inplace=True)
         df_1h.reset_index(inplace=True)
 
-        # 计算 1H 指标
-        df_1h = self._calculate_indicators_1h(df_1h)
+        # 检查数据量
+        print(f"🧐 数据校验: 1M={len(df_1m)}条 | 1H={len(df_1h)}条 (有效策略时长)")
 
-        # 🔥 预计算所有 1H 的信号 (Actions)
-        # 这样我们在 1m 循环时，直接查表即可，极大提高速度
-        signal_map = {}
-        mock_ai_result = {"score": 0, "reason": "Backtest"}  # 回测时不含AI分
+        return df_1m, df_1h
 
-        print("🤖 正在调用 Factor Engine 生成信号图谱...")
+    def pre_calculate_signals(self, df_1h):
+        print("🧠 计算策略信号 (RSI逻辑已修正)...")
+        signals = {}
+        high_scores = 0
+
         for idx, row in df_1h.iterrows():
-            market_data = self._row_to_market_data(row)
-            tech_score, tech_sub, _ = self.engine.calculate_technical_score(market_data)
-            fusion = self.engine.fuse_signals(tech_score, tech_sub, mock_ai_result)
-            # Key 是 timestamp (整点时间)
-            signal_map[row['timestamp']] = fusion['action']
+            state = self.tech_analyzer.get_market_state(row)
 
-        # 3. 开始 1m 级精细回放
-        print("🚀 开始 1M 级高保真回放 (策略:1H | 风控:1M)...")
-        df_1m.reset_index(inplace=True)
+            rsi = state.get('momentum', {}).get('rsi')
+            ema_s = state.get('trend', {}).get('ema_short')
+            ema_l = state.get('trend', {}).get('ema_long')
 
-        for index, row in df_1m.iterrows():
-            current_time = row['timestamp']
-            current_price = row['close']
+            # 🔥 防御性检查：只要有空值就跳过
+            if rsi is None or ema_s is None or ema_l is None:
+                continue
 
-            # === A. 优先检查风控 (每分钟) ===
-            if self.btc > 0:  # 只有持仓时才检查
-                # 计算这分钟内的极端价格，看是否触发止盈止损
-                low_price = row['low']
-                high_price = row['high']
+                # 🔥 [关键修正] RSI 分数反转
+            # RSI=30(超卖) -> 100-30=70分 (高分买入)
+            tech_score = 100 - rsi
 
-                # 浮动盈亏计算
-                worst_pnl = (low_price - self.entry_price) / self.entry_price
-                best_pnl = (high_price - self.entry_price) / self.entry_price
+            # 趋势分
+            trend_score = 80 if ema_s > ema_l else 20
 
-                # 1. 止损检查 (-5%)
-                if worst_pnl <= -self.STOP_LOSS_PCT:
-                    # 假设在触发价成交 (或者稍微滑一点)
-                    exit_price = self.entry_price * (1 - self.STOP_LOSS_PCT)
-                    self._execute_sell(current_time, exit_price, "STOP_LOSS")
-                    continue  # 本分钟交易结束
+            # 回测无 AI
+            sentiment_score = 0
 
-                # 2. 止盈检查 (+20%)
-                if best_pnl >= self.TAKE_PROFIT_PCT:
-                    exit_price = self.entry_price * (1 + self.TAKE_PROFIT_PCT)
-                    self._execute_sell(current_time, exit_price, "TAKE_PROFIT")
-                    continue
+            # 评估
+            decision = self.evaluator.evaluate(tech_score, sentiment_score, trend_score)
+            signals[row['timestamp']] = decision['action']
 
-            # === B. 检查策略信号 (仅在整点) ===
-            # 我们检查当前时间是否在 signal_map 中
-            # map 的 key 是 1H 的整点时间 (如 14:00:00)
-            # df_1m 的 time 也是 timestamp
+            if decision['final_score'] >= self.cfg.get("scoring.thresholds.buy", 75):
+                high_scores += 1
 
-            # 为了对齐：通常我们是在整点收盘后，下一个整点的第0分钟开单
-            # 简单做法：直接查表
-            if current_time in signal_map:
-                action = signal_map[current_time]
+        print(f"🧐 [统计] 触发买入信号次数: {high_scores}")
+        return signals
 
-                if action in ["BUY", "STRONG_BUY"]:
-                    # 只有空仓且有钱才买
-                    if self.btc == 0 and self.usdt > 10:
-                        self._execute_buy(current_time, current_price)
+    def run(self):
+        df_1m, df_1h = self.fetch_data()
+        signal_map = self.pre_calculate_signals(df_1h)
 
+        print(f"🚀 开始回放 {len(df_1m)} 分钟数据...")
+        last_processed_hour = None
+
+        for idx, row in df_1m.iterrows():
+            curr_time = row['timestamp']
+            curr_price = row['close']
+
+            # === A. 风控检查 (每分钟) ===
+            if self.btc > 0:
+                triggered = self._check_risk_management(curr_time, row['low'], row['high'])
+                if triggered: continue
+
+                # === B. 策略信号检查 (整点) ===
+            current_hour = curr_time.floor('1h')
+            prev_hour = current_hour - timedelta(hours=1)
+
+            # 在整点后 5 分钟内，执行上个小时的信号
+            if curr_time.minute < 5 and current_hour != last_processed_hour:
+
+                # 查表
+                action = signal_map.get(prev_hour, "HOLD")
+
+                if action == "BUY":
+                    if self.btc == 0:
+                        self._buy(curr_time, curr_price, "SIGNAL")
+                        last_processed_hour = current_hour
                 elif action == "SELL":
-                    # 只有持仓才卖
                     if self.btc > 0:
-                        self._execute_sell(current_time, current_price, "STRATEGY_EXIT")
+                        self._sell(curr_time, curr_price, "SIGNAL")
+                        last_processed_hour = current_hour
 
-            # 记录净值
-            total_val = self.usdt + (self.btc * current_price)
-            self.history.append({'time': current_time, 'value': total_val, 'price': current_price})
+            # 记录资金曲线
+            if curr_time.minute == 0:
+                equity = self.usdt + (self.btc * curr_price)
+                self.equity_curve.append({'time': curr_time, 'equity': equity})
 
-        self._print_report()
-        self._plot_curve()
+        self._generate_report()
 
-    def _execute_buy(self, time, price):
-        # 全仓买入
-        qty = (self.usdt * 0.999) / price  # 留一点点余量防止精度问题
-        cost = qty * price
-        fee = cost * self.COMMISSION
+    def _check_risk_management(self, time, low, high):
+        """盘中风控检查"""
+        # 1. 止损
+        pnl_low = (low - self.entry_price) / self.entry_price
+        if pnl_low <= -self.stop_loss_pct:
+            exec_price = self.entry_price * (1 - self.stop_loss_pct)
+            if low < exec_price: exec_price = (exec_price + low) / 2  # 模拟滑点
+            self._sell(time, exec_price, f"🛑 STOP_LOSS ({pnl_low * 100:.1f}%)")
+            return True
 
-        self.usdt -= cost
-        self.btc += (qty - (qty * self.COMMISSION))  # 扣币式手续费
-        self.entry_price = price
+        # 2. 止盈
+        pnl_high = (high - self.entry_price) / self.entry_price
+        if pnl_high >= self.take_profit_pct:
+            exec_price = self.entry_price * (1 + self.take_profit_pct)
+            self._sell(time, exec_price, f"💰 TAKE_PROFIT ({pnl_high * 100:.1f}%)")
+            return True
+        return False
 
-        self.trades.append({'time': time, 'type': 'BUY', 'price': price, 'qty': qty, 'reason': 'SIGNAL'})
+    def _buy(self, time, price, reason):
+        # 使用 PositionManager 计算数量
+        qty = self.pos_manager.calculate_buy_size(price, self.usdt)
 
-    def _execute_sell(self, time, price, reason):
-        # 全仓卖出
-        qty = self.btc
-        revenue = qty * price
-        fee = revenue * self.COMMISSION
+        if qty > 0:
+            cost = qty * price
+            fee = cost * self.commission
 
-        self.btc = 0
+            # 资金修正：如果不够手续费，稍微减仓
+            if cost + fee > self.usdt:
+                qty = qty * 0.99
+                cost = qty * price
+                fee = cost * self.commission
+
+            self.usdt -= (cost + fee)
+            self.btc += qty
+            self.entry_price = price
+            self.trades.append({'time': time, 'type': 'BUY', 'price': price, 'qty': qty, 'reason': reason})
+
+    def _sell(self, time, price, reason):
+        revenue = self.btc * price
+        fee = revenue * self.commission
+        profit = (revenue - fee) - (self.btc * self.entry_price)
+        profit_pct = profit / (self.btc * self.entry_price) * 100
+
         self.usdt += (revenue - fee)
-
-        pnl_pct = (price - self.entry_price) / self.entry_price * 100
         self.trades.append(
-            {'time': time, 'type': 'SELL', 'price': price, 'qty': qty, 'reason': f"{reason} ({pnl_pct:+.2f}%)"})
+            {'time': time, 'type': 'SELL', 'price': price, 'qty': self.btc, 'reason': reason, 'pnl': profit,
+             'pnl_pct': profit_pct})
+        self.btc = 0
         self.entry_price = 0
 
-    def _print_report(self):
-        if not self.history: return
-        end_val = self.history[-1]['value']
-        profit = end_val - self.initial_capital
-        roi = (profit / self.initial_capital) * 100
+    def _generate_report(self):
+        print("\n" + "=" * 40)
+        print("📊 回测报告 (Backtest Report)")
+        print("=" * 40)
 
-        # 计算最大回撤
-        values = [h['value'] for h in self.history]
-        peak = values[0]
-        max_drawdown = 0
-        for v in values:
-            if v > peak: peak = v
-            dd = (peak - v) / peak
-            if dd > max_drawdown: max_drawdown = dd
+        final_equity = self.usdt
+        if self.btc > 0 and self.equity_curve: final_equity = self.equity_curve[-1]['equity']
 
-        print("\n" + "=" * 60)
-        print(f"📊 120天 回测报告 (策略:1H | 风控:1M)")
-        print("=" * 60)
-        print(f"💰 初始资金: {self.initial_capital:.2f} U")
-        print(f"💰 最终资金: {end_val:.2f} U")
-        print(f"📈 净利润  : {profit:+.2f} U")
-        print(f"🚀 收益率  : {roi:+.2f}%")
-        print(f"🛡️ 最大回撤: {max_drawdown * 100:.2f}%")
-        print(f"📝 交易次数: {len(self.trades)}")
-        print("-" * 60)
-        print("交易明细:")
-        for t in self.trades[-10:]:  # 只打最后10条
-            print(f"  {t['time']} {t['type']} @ {t['price']:.2f} [{t['reason']}]")
-        if len(self.trades) > 10: print("  ... (更多记录已省略)")
-        print("=" * 60)
+        ret = (final_equity - self.initial_balance) / self.initial_balance * 100
+        print(f"资金: {self.initial_balance:.2f} -> {final_equity:.2f} U")
+        print(f"收益: {ret:+.2f}%")
+        print(f"交易: {len([t for t in self.trades if t['type'] == 'SELL'])} 次")
+        print(f"风控: SL={self.stop_loss_pct * 100}% | TP={self.take_profit_pct * 100}%")
 
-    def _plot_curve(self):
-        if not self.history: return
-        # 因为数据量太大(120天*1440分钟)，绘图时降采样一下，每小时画一个点
-        df_res = pd.DataFrame(self.history)
-        df_res = df_res.iloc[::60, :]
+        if self.equity_curve:
+            df = pd.DataFrame(self.equity_curve)
+            plt.figure(figsize=(10, 6))
+            plt.plot(df['time'], df['equity'], label='Equity')
 
-        fig, ax1 = plt.subplots(figsize=(12, 6))
-        ax1.plot(df_res['time'], df_res['value'], color='blue', label='Equity')
-        ax1.set_ylabel('USDT', color='blue')
+            for t in self.trades:
+                if t['type'] == 'BUY':
+                    plt.scatter(t['time'], t['price'], marker='^', c='g', s=60)
+                elif 'STOP' in t['reason']:
+                    plt.scatter(t['time'], t['price'], marker='x', c='k', s=60, label='Stop Loss')
+                elif 'TAKE' in t['reason']:
+                    plt.scatter(t['time'], t['price'], marker='*', c='gold', s=80, label='Take Profit')
+                else:
+                    plt.scatter(t['time'], t['price'], marker='v', c='r', s=60)
 
-        ax2 = ax1.twinx()
-        ax2.plot(df_res['time'], df_res['price'], color='gray', alpha=0.3, label='BTC Price')
-
-        # 标记买卖点
-        for t in self.trades:
-            if t['type'] == 'BUY':
-                ax1.scatter(t['time'], t['price'], marker='^', color='green', s=80)
-            else:
-                # 区分止损和策略卖出
-                color = 'red' if 'STOP' in t['reason'] else 'orange'
-                ax1.scatter(t['time'], t['price'], marker='v', color=color, s=80)
-
-        plt.title(f"Backtest: 1H Strategy + 1M Risk Control ({self.days} Days)")
-        plt.show()
+            plt.title(f"Backtest: {ret:.2f}% Return")
+            plt.legend()
+            plt.show()
 
 
 if __name__ == "__main__":
-    # 直接运行
-    bt = RiskBacktester(symbol='BTC/USDT', days=120)
+    # 🔥 记得去 data/ 目录删掉旧的 csv 文件，让它重新下载新的 60 天数据！
+    bt = BacktestEngine(symbol="BTC/USDT", days=60)
     bt.run()

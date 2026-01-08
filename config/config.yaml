@@ -1,0 +1,63 @@
+# config/config.yaml
+
+# === 基础设置 ===
+project_name: "QuantBot v2.0"
+run_mode: "PAPER"  # PAPER(模拟) | REAL(实盘)
+log_level: "INFO"
+
+# === 交易标的与周期 ===
+symbols:
+  - "BTC/USDT"
+  # - "ETH/USDT"
+  # - "SOL/USDT" # 支持列表扩展
+
+timeframe: "1h"
+
+# === 资金管理 (复利系统) ===
+money_management:
+  # mode: "compound"       # compound(复利) | fixed(单利)
+  risk_per_trade: 0.1    # 复利模式：每次投入总权益的 10%
+  fixed_qty: 0.1
+  mode: "fixed"
+
+# === 智能代理 ===
+proxy:
+  enabled: true
+  port: 7897             # 本地代理端口
+  host: "127.0.0.1"
+
+# === AI 模型配置 ===
+ai:
+  provider: "deepseek"   # deepseek | gemini | openai
+  model_name: "deepseek-chat"
+
+scoring:
+  weights:
+    technical: 0.4
+    sentiment: 0.4
+    trend: 0.2
+
+  # 🔥 [修改] 统一改为 0-100 分制
+  thresholds:
+    buy: 75.0
+    sell: 30.0
+
+# 回测时 AI 分数为 0，必须提高技术和趋势的权重，否则无法触发交易
+scoring_backtest:
+  weights:
+    technical: 0.7   # 🔥 没了 AI，RSI 必须挑大梁
+    sentiment: 0.0   # 💀 强制归零，防止拖后腿
+    trend: 0.3       # 趋势辅助
+  thresholds:
+    buy: 65.0        # 🔥 回测门槛稍微放宽 (纯技术面很难达到 75)
+    sell: 35.0
+
+notification:
+  email:
+    enabled: true
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+
+risk_management:
+  stop_loss: 0.05       # 止损: 跌 5% 强制卖出
+  take_profit: 0.20     # 止盈: 涨 20% 强制卖出

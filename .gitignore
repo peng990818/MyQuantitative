@@ -19,3 +19,7 @@ config.json
 secret.py
 
 *.csv
+
+*.log
+
+config/secrets.yaml
