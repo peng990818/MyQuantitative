@@ -1,5 +1,6 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+import mplfinance as mpf
 import os
 import sys
 import warnings
@@ -7,325 +8,340 @@ from datetime import timedelta
 import numpy as np
 import re
 
-# === 基础设置与警告屏蔽 ===
+# === 基础设置 ===
 warnings.simplefilter(action='ignore', category=FutureWarning)
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from utils.config_loader import ConfigLoader
 from utils.logger import logger
 from modules.market.loader import MarketDataLoader
-from modules.analysis.technical import TechnicalAnalyzer
-from modules.strategy.evaluator import StrategyEvaluator
 from core.position import PositionManager
+
+# 🔥 引入 AI 预言机
+from core.market_oracle import MarketRegimeOracle
+
+# 引入 v20 策略 (策略路由版)
+from strategies.sniper_router import SniperRouterStrategy
 
 
 def parse_timeframe(tf: str):
-    """
-    支持：1h, 4h, 15m, 30m, 5m 等
-    返回：(pandas_freq_str, timedelta)
-    """
     m = re.fullmatch(r"(\d+)([mh])", tf.strip().lower())
-    if not m:
-        raise ValueError(f"Unsupported timeframe format: {tf}")
-    n = int(m.group(1))
-    unit = m.group(2)
-
-    if unit == "h":
-        return f"{n}H", timedelta(hours=n)
-    else:
-        return f"{n}min", timedelta(minutes=n)
+    if not m: raise ValueError(f"Timeframe Error: {tf}")
+    n, unit = int(m.group(1)), m.group(2)
+    return (f"{n}H", timedelta(hours=n)) if unit == "h" else (f"{n}min", timedelta(minutes=n))
 
 
 class BacktestEngine:
-    def __init__(self, symbol="BTC/USDT", days=120):
+    def __init__(self, symbol="BTC/USDT", days=120, start_date=None, end_date=None):
         self.cfg = ConfigLoader()
         self.cfg._config['run_mode'] = 'BACKTEST'
-
-        # 🔥 回测专用权重
-        self.cfg._config['scoring'] = {
-            'weights': {'technical': 0.7, 'sentiment': 0.0, 'trend': 0.3},
-            'thresholds': {'buy': 80, 'sell': 40}
-        }
-
         self.symbol = symbol
         self.days = days
-        self.timeframe_str = self.cfg.get("timeframe", "1h")
+        self.start_date = start_date
+        self.end_date = end_date
 
+        self.timeframe_str = "1h"
         self.tf_freq, self.tf_delta = parse_timeframe(self.timeframe_str)
 
         self.market = MarketDataLoader()
-        self.tech_analyzer = TechnicalAnalyzer()
-        self.evaluator = StrategyEvaluator()
         self.pos_manager = PositionManager()
 
-        # 账户初始状态
+        # 🔥 初始化 AI 预言机
+        # 你需要自己创建一个 csv 放在 data/ai_regime.csv，或者它会默认用技术指标
+        self.oracle = MarketRegimeOracle(data_path="data/ai_regime.csv")
+
+        # 加载 v20 策略
+        self.strategy = SniperRouterStrategy()
+        logger.info(f"🧠 已加载策略: {self.strategy.name}")
+
+        # 账户
         self.initial_balance = 10000.0
         self.usdt = self.initial_balance
         self.btc = 0.0
         self.entry_price = 0.0
         self.trades = []
         self.equity_curve = []
-        self.last_price = None
 
-        # 风险管理变量
-        self.dynamic_sl_price = 0.0
-        self.max_seen_price = 0.0
+        # 风控变量
+        self.target_tp_price = 0.0
+        self.target_sl_price = 0.0
+
+        # 移动止盈状态
+        self.trailing_enabled = False
+        self.trailing_active = False
+        self.trailing_activation_price = 0.0
+        self.trailing_callback_pct = 0.0
+        self.highest_price_since_entry = 0.0
+
         self.commission = 0.001
+        self.slippage_bps = 5
+        self.equity_sample_minutes = 60
+        self.df_tf = None
 
-        # 成交模型（可调）
-        self.slippage_bps = 5  # 5 bps = 0.05%
-
-        # 权益曲线记录频率（分钟）
-        self.equity_sample_minutes = 1
-
-        logger.info(f"🚀 Backtest v8.1 启动 | 标的: {symbol} | TF: {self.timeframe_str}")
+        # 记录 AI 历史状态用于绘图
+        self.ai_regime_history = []
 
     def fetch_and_prepare(self):
+        # ... (保持不变) ...
         safe_symbol = self.symbol.replace('/', '_')
-        cache_file = f"data/backtest_{safe_symbol}_{self.days}d.csv"
+        if self.start_date:
+            s_tag = self.start_date.split(' ')[0]
+            e_tag = self.end_date.split(' ')[0] if self.end_date else "NOW"
+            cache_file = f"data/backtest_{safe_symbol}_{s_tag}_{e_tag}.csv"
+            if not os.path.exists(cache_file):
+                logger.info(f"📥 正在下载指定范围数据: {self.start_date} -> {self.end_date}")
+                self.market.fetch_history_range(self.symbol, "1m", self.start_date, self.end_date, cache_file)
+        else:
+            cache_file = f"data/backtest_{safe_symbol}_{self.days}d.csv"
+            if not os.path.exists(cache_file):
+                logger.info(f"📥 正在下载最近 {self.days} 天数据...")
+                self.market.fetch_and_save_data(self.symbol, "1m", self.days, cache_file)
+
         if not os.path.exists(cache_file):
-            raise Exception(f"找不到缓存文件 {cache_file}")
+            logger.error("❌ 数据文件未找到")
+            sys.exit(1)
 
         df_1m = pd.read_csv(cache_file)
         df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'])
         df_1m.sort_values('timestamp', inplace=True)
-
-        # ---- resample 生成 TF K线（明确 label/closed，避免歧义）----
         df_1m.set_index('timestamp', inplace=True)
+
         df_tf = df_1m.resample(self.tf_freq, label="left", closed="left").agg({
             'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
         }).dropna()
 
-        # 指标计算
-        df_tf = self.tech_analyzer.calculate_indicators(df_tf)
+        df_tf = self.strategy.calculate_indicators(df_tf)
         df_tf.dropna(inplace=True)
+        self.df_tf = df_tf.copy()
 
-        # reset index
         df_1m.reset_index(inplace=True)
         df_tf.reset_index(inplace=True)
-
-        # --- 强校验：避免指标列名不匹配导致 silent fallback ---
-        required_cols = ["EMA_50", "EMA_200", "ATRr_14"]
-        missing = [c for c in required_cols if c not in df_tf.columns]
-        if missing:
-            raise ValueError(
-                f"Indicators missing in df_tf: {missing}. "
-                f"Please align calculate_indicators() output column names."
-            )
-
         return df_1m, df_tf
 
     def run(self):
         df_1m, df_tf = self.fetch_and_prepare()
 
-        # 预计算信号：key 用 TF candle 的 timestamp（label=left）
-        signal_map = self._pre_calculate_signals(df_tf)
+        print(f"📉 预计算策略信号...")
+        signal_map = {}
 
-        # TF 指标快速查询：timestamp -> row(dict-like)
-        tf_lookup = {row['timestamp']: row for _, row in df_tf.iterrows()}
+        # 遍历 1H K线生成信号
+        for index, row in df_tf.iterrows():
+            curr_time = row['timestamp']
 
-        print(f"📉 开始步进回放 (v8.1 修复lookahead + 更真实成交)...")
+            # 🔥🔥🔥 关键修改：获取 AI 观点并注入策略 🔥🔥🔥
+            # 1. 问预言机
+            ai_regime = self.oracle.get_regime(curr_time)
+
+            # 2. 注入到 row 数据中 (临时添加一列)
+            # 策略里的 check_signal 会读取这一列
+            row_with_ai = row.copy()
+            if ai_regime:
+                row_with_ai['AI_REGIME'] = ai_regime
+                self.ai_regime_history.append({'time': curr_time, 'regime': ai_regime})
+
+            # 3. 策略根据 AI 观点 + 技术指标 生成信号
+            sig = self.strategy.check_signal(row_with_ai)
+
+            if sig['action'] == "BUY":
+                signal_map[curr_time] = sig
+
         last_candle_time = None
 
+        print(f"▶️ 开始回放...")
         for _, row in df_1m.iterrows():
             curr_time = row['timestamp']
             curr_price = float(row['close'])
-            self.last_price = curr_price
+            current_candle_start = curr_time.floor(self.tf_freq)
+            prev_candle_finished = current_candle_start - self.tf_delta
 
-            # 当前所在 TF candle（左端点对齐）
-            current_candle = curr_time.floor(self.tf_freq)
-            prev_candle = current_candle - self.tf_delta  # ✅ 上一根已收盘 candle
-
-            # --- A. 风险管理（只用 prev_candle 指标，杜绝偷看未来） ---
             if self.btc > 0:
-                if self._handle_risk_management(curr_time, row, tf_lookup, prev_candle):
-                    # 平仓后跳过信号逻辑
+                if self._handle_risk_dynamic(curr_time, row):
                     self._sample_equity(curr_time, curr_price)
                     continue
 
-            # --- B. 信号执行（同样只执行上一根已收盘 candle 的信号） ---
-            if current_candle != last_candle_time:
-                sig = signal_map.get(prev_candle)
+            if current_candle_start != last_candle_time:
+                sig = signal_map.get(prev_candle_finished)
                 if sig and sig['action'] == "BUY" and self.btc == 0:
-                    self._execute_buy(curr_time, curr_price, sig['atr'])
-                last_candle_time = current_candle
+                    self._execute_buy(curr_time, curr_price, sig)
+                last_candle_time = current_candle_start
 
-            # --- C. 记录权益曲线 ---
             self._sample_equity(curr_time, curr_price)
+
+        if self.btc > 0:
+            self._execute_sell(df_1m.iloc[-1]['timestamp'], df_1m.iloc[-1]['close'], "END")
 
         self._show_report()
 
-    def _sample_equity(self, curr_time, curr_price):
-        if self.equity_sample_minutes <= 0:
-            return
-        if curr_time.minute % self.equity_sample_minutes == 0 and curr_time.second == 0:
-            equity = self.usdt + (self.btc * curr_price)
-            self.equity_curve.append({'time': curr_time, 'equity': equity})
+    # ... (风控 _handle_risk_dynamic, _execute_buy, _execute_sell, _sample_equity 保持不变) ...
+    def _handle_risk_dynamic(self, time, row_1m):
+        high = float(row_1m['high'])
+        low = float(row_1m['low'])
 
-    def _pre_calculate_signals(self, df_tf):
-        signals = {}
-        for _, row in df_tf.iterrows():
-            state = self.tech_analyzer.get_market_state(row)
-            adx = state['trend']['adx']
-            z_score = state['momentum']['z_score']
-            ema50 = state['trend']['ema_mid']
-            ema200 = state['trend']['ema_long']
-
-            tech_score = 40
-            # v8.x：强趋势 + 均线多头 + 适度回调
-            if adx > 32 and row['close'] > ema50 > ema200:
-                if -1.2 < z_score < 0.2:
-                    tech_score = 95
-
-            decision = self.evaluator.evaluate(tech_score, 0, 80)
-            if decision['final_score'] >= 80:
-                signals[row['timestamp']] = {
-                    'action': "BUY",
-                    'atr': float(state['volatility']['atr'])
-                }
-        return signals
-
-    def _handle_risk_management(self, time, row_1m, tf_lookup, prev_candle_time):
-        """
-        v8.1：Trailing Stop + Trend Exit
-        ✅ 指标只取 prev_candle（上一根已收盘TF K线），避免lookahead。
-        """
-        curr_price = float(row_1m['close'])
-        pnl_pct = (curr_price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0.0
-
-        # 更新持仓期间最高价（用 1m high）
-        self.max_seen_price = max(self.max_seen_price, float(row_1m['high']))
-
-        # 取上一根已收盘 TF 指标
-        tf_row = tf_lookup.get(prev_candle_time, None)
-        if tf_row is None:
-            # TF 不足时做保守 fallback
-            current_atr = self.entry_price * 0.02
-            curr_ema50 = None
-        else:
-            current_atr = float(tf_row['ATRr_14'])
-            curr_ema50 = float(tf_row['EMA_50'])
-
-        # 1) 吊灯止损：max_seen_price - 3 * ATR
-        trailing_stop = self.max_seen_price - (3.0 * current_atr)
-        self.dynamic_sl_price = max(self.dynamic_sl_price, trailing_stop)
-
-        # A) 止损触发：用更保守的成交模型（避免“完美止损价成交”）
-        if float(row_1m['low']) <= self.dynamic_sl_price:
-            fill_price = self._stop_fill_price(row_1m, self.dynamic_sl_price)
-            self._execute_sell(time, fill_price, "🛑 TRAILING_STOP")
+        # 1. 硬止损
+        if low <= self.target_sl_price:
+            fill = min(float(row_1m['open']), self.target_sl_price) * (1 - self.slippage_bps / 10000)
+            self._execute_sell(time, fill, "🛑 STOP_LOSS")
             return True
 
-        # B) 趋势离场：盈利 >3% 且跌破 EMA50（EMA50 来自上一根已收盘 TF）
-        if curr_ema50 is not None and curr_price < curr_ema50 and pnl_pct > 0.03:
-            fill_price = self._market_fill_price(curr_price)
-            self._execute_sell(time, fill_price, "📉 TREND_EXIT")
+        # 2. 移动止盈
+        if self.trailing_enabled:
+            if high > self.highest_price_since_entry:
+                self.highest_price_since_entry = high
+
+            if not self.trailing_active:
+                if high >= self.trailing_activation_price:
+                    self.trailing_active = True
+
+            if self.trailing_active:
+                dynamic_sl = self.highest_price_since_entry * (1 - self.trailing_callback_pct)
+                if low <= dynamic_sl:
+                    self._execute_sell(time, dynamic_sl, "🏄 TRAILING_PROFIT")
+                    return True
+
+        # 3. 固定止盈
+        if high >= self.target_tp_price:
+            self._execute_sell(time, self.target_tp_price, "🚀 FIXED_TP")
             return True
 
         return False
 
-    def _stop_fill_price(self, row_1m, stop_price):
-        """
-        止损成交模型（保守）：
-        - 如果本分钟开盘价就已经在止损价下方，按 open 成交（gap）
-        - 否则按 stop_price 成交
-        - 再叠加滑点
-        """
-        o = float(row_1m['open'])
-        fill = o if o < stop_price else stop_price
-        # 滑点（卖出时往不利方向：更低）
-        fill *= (1 - self.slippage_bps / 10000.0)
-        return fill
+    def _execute_buy(self, t, p, sig):
+        qty = self.pos_manager.calculate_buy_size(p, self.usdt)
+        if qty <= 0: return
 
-    def _market_fill_price(self, price):
-        """
-        市价成交模型（卖出）：叠加滑点（更低）
-        """
-        return float(price) * (1 - self.slippage_bps / 10000.0)
+        p_real = p * (1 + self.slippage_bps / 10000)
+        cost = qty * p_real * (1 + self.commission)
+        if cost > self.usdt: return
 
-    def _execute_buy(self, time, price, atr):
-        qty = self.pos_manager.calculate_buy_size(price, self.usdt)
-        if qty <= 0:
-            return
-
-        cost = qty * price
-        fee = cost * self.commission
-
-        if cost + fee > self.usdt:
-            # 防止超买（极端情况下 PositionManager 返回过大）
-            return
-
-        self.usdt -= (cost + fee)
+        self.usdt -= cost
         self.btc = qty
-        self.entry_price = float(price)
+        self.entry_price = p_real
 
-        self.max_seen_price = float(price)
-        self.dynamic_sl_price = float(price) - (2.5 * float(atr))
+        sl_pct = sig.get('sl_pct', 0.05)
+        self.target_sl_price = p_real * (1 - sl_pct)
 
-        self.trades.append({'time': time, 'type': 'BUY', 'price': float(price), 'qty': float(qty)})
+        tp_pct = sig.get('tp_pct', 0.08)
+        self.target_tp_price = p_real * (1 + tp_pct)
 
-    def _execute_sell(self, time, price, reason):
-        revenue = self.btc * float(price)
-        fee = revenue * self.commission
+        self.trailing_enabled = sig.get('use_trailing', False)
+        if self.trailing_enabled:
+            t_start = sig.get('trailing_start', 0.03)
+            self.trailing_activation_price = p_real * (1 + t_start)
+            self.trailing_callback_pct = sig.get('trailing_drop', 0.02)
+            self.trailing_active = False
+            self.highest_price_since_entry = p_real
 
-        cost_basis = self.btc * self.entry_price
-        pnl = (revenue - fee) - cost_basis
-        pnl_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0.0
+        self.trades.append({'time': t, 'type': 'BUY', 'price': p_real, 'qty': qty,
+                            'mode': 'TRAILING' if self.trailing_enabled else 'FIXED'})
 
-        self.usdt += (revenue - fee)
-        self.trades.append({
-            'time': time, 'type': 'SELL', 'price': float(price),
-            'pnl': float(pnl), 'pnl_pct': float(pnl_pct), 'reason': reason
-        })
+    def _execute_sell(self, t, p, reason):
+        rev = self.btc * p * (1 - self.commission)
+        pnl = rev - (self.btc * self.entry_price)
+        pnl_pct = pnl / (self.btc * self.entry_price) * 100
+        self.usdt += rev
+        self.trades.append({'time': t, 'type': 'SELL', 'price': p, 'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason})
+        self.btc = 0
+        self.entry_price = 0
 
-        # reset position
-        self.btc = 0.0
-        self.entry_price = 0.0
-        self.max_seen_price = 0.0
-        self.dynamic_sl_price = 0.0
+    def _sample_equity(self, t, p):
+        if t.minute % self.equity_sample_minutes == 0:
+            self.equity_curve.append({'time': t, 'equity': self.usdt + self.btc * p})
 
     def _show_report(self):
-        print("\n" + "=" * 40)
-        print("📊 QuantBot v8.1 回测报告（修复lookahead）")
-        print("=" * 40)
+        if not self.trades:
+            print("⚠️ 无交易记录")
+            return
 
-        last_price = self.last_price if self.last_price is not None else 0.0
-        final_equity = self.usdt + (self.btc * last_price)
-        total_ret = (final_equity - self.initial_balance) / self.initial_balance * 100
+        df_trades = pd.DataFrame(self.trades)
+        df_equity = pd.DataFrame(self.equity_curve).set_index('time')
 
-        df_curve = pd.DataFrame(self.equity_curve)
-        if df_curve.empty:
-            print("⚠️ equity_curve 为空（可能采样频率设置导致），跳过回撤计算。")
-            mdd = 0.0
-        else:
-            df_curve['peak'] = df_curve['equity'].cummax()
-            mdd = ((df_curve['peak'] - df_curve['equity']) / df_curve['peak']).max() * 100
+        final_equity = df_equity.iloc[-1]['equity']
+        total_return = (final_equity - self.initial_balance) / self.initial_balance * 100
 
-        sells = [t for t in self.trades if t.get('type') == 'SELL']
-        wins = [t for t in sells if t.get('pnl', 0) > 0]
-        win_rate = len(wins) / len(sells) if sells else 0
+        sells = df_trades[df_trades['type'] == 'SELL']
+        total_trades = len(sells)
+        wins = sells[sells['pnl'] > 0]
+        win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
 
-        print(f"💰 最终净值: {final_equity:.2f} (收益率: {total_ret:+.2f}%)")
-        print(f"📉 最大回撤: {mdd:.2f}%")
-        print(f"📈 交易次数: {len(sells)} | 胜率: {win_rate * 100:.1f}%")
+        print("\n" + "=" * 50)
+        print(f"📊 策略: {self.strategy.name}")
+        print("-" * 50)
+        print(f"💰 最终净值: {final_equity:.2f} USDT")
+        print(f"📈 收益率  : {total_return:+.2f}%")
+        print(f"🔄 交易次数: {total_trades}")
+        print(f"🎯 胜率    : {win_rate:.1f}%")
+        print("=" * 50 + "\n")
 
-        if sells:
-            avg_win = sum([t['pnl_pct'] for t in wins]) / len(wins) if wins else 0.0
-            losses = [t for t in sells if t.get('pnl', 0) <= 0]
-            avg_loss = sum([t['pnl_pct'] for t in losses]) / len(losses) if losses else 0.0
+        print("🔍 最近 5 笔交易详情:")
+        print(df_trades[['time', 'type', 'pnl_pct', 'reason']].tail(10))
+        print("=" * 50 + "\n")
 
-            if avg_loss != 0:
-                print(f"⚖️ 盈亏比: {abs(avg_win / avg_loss):.2f} (平均赢: {avg_win:.2f}% / 平均输: {avg_loss:.2f}%)")
-            else:
-                print(f"⚖️ 平均赢: {avg_win:.2f}% / 平均输: {avg_loss:.2f}%")
+        self._plot_charts(df_trades, df_equity)
 
-        # plot
-        if not df_curve.empty:
-            plt.figure(figsize=(12, 6))
-            plt.plot(df_curve['time'], df_curve['equity'], label='Equity')
-            plt.legend()
-            plt.show()
+    def _plot_charts(self, df_trades, df_equity):
+        logger.info("🎨 正在生成图表...")
+        plot_data = self.df_tf.copy()
+        ts_index = plot_data.index
+        buys = pd.Series(np.nan, index=ts_index)
+        sells = pd.Series(np.nan, index=ts_index)
+        for _, t in df_trades.iterrows():
+            idx = t['time'].floor(self.tf_freq)
+            if idx in ts_index:
+                if t['type'] == 'BUY':
+                    buys.loc[idx] = t['price'] * 0.98
+                elif t['type'] == 'SELL':
+                    sells.loc[idx] = t['price'] * 1.02
+
+        apds = [
+            mpf.make_addplot(buys, type='scatter', markersize=80, marker='^', color='g'),
+            mpf.make_addplot(sells, type='scatter', markersize=80, marker='v', color='r')
+        ]
+
+        # 绘制均线和布林带
+        if 'EMA_55' in plot_data.columns:
+            apds.append(mpf.make_addplot(plot_data['EMA_55'], color='orange', width=1.5))
+        if 'BB_Long_Lower' in plot_data.columns:
+            apds.append(mpf.make_addplot(plot_data['BB_Long_Lower'], color='darkblue', width=1.5))
+        if 'BB_Short_Lower' in plot_data.columns:
+            apds.append(mpf.make_addplot(plot_data['BB_Short_Lower'], color='skyblue', width=1))
+
+        # 🔥 可视化 AI 状态 (在副图显示不同颜色的色块或线条)
+        # 这里用简单的办法：在价格图下方画一条状态线
+        if self.ai_regime_history:
+            df_regime = pd.DataFrame(self.ai_regime_history).set_index('time')
+            # 重新索引对齐 K 线
+            df_regime = df_regime.reindex(ts_index, method='ffill')
+
+            # 将文本转为数字以便绘图: BULL=1, SHOCK=0, BEAR=-1
+            regime_val = df_regime['regime'].map({
+                'BULL_TREND': 1,
+                'SHOCK_SIDEWAYS': 0,
+                'BEAR_CRASH': -1
+            }).fillna(0)
+
+            # 在副图 2 画出 AI 状态
+            apds.append(
+                mpf.make_addplot(regime_val, panel=2, color='purple', title='AI Regime', ylabel='Bull(1)/Bear(-1)'))
+
+        equity_aligned = df_equity['equity'].reindex(ts_index, method='ffill')
+        apds.append(mpf.make_addplot(equity_aligned, panel=1, color='cyan', title='Equity'))
+
+        s = mpf.make_mpf_style(marketcolors=mpf.make_marketcolors(up='green', down='red', inherit=True), gridstyle=':')
+        mpf.plot(plot_data, type='candle', style=s, addplot=apds, volume=True, panel_ratios=(6, 2, 2),
+                 title=f"Backtest: {self.strategy.name}", datetime_format='%Y-%m-%d', tight_layout=True)
 
 
 if __name__ == "__main__":
-    BacktestEngine(days=120).run()
+    print("🔥 正在进行 2021 史诗级全能测试...")
+
+    # 策略路由 v20 会读取上面生成的 csv
+    # 1月-4月: 它会用 BullStrategy 狂赚
+    # 5月-7月: 它会用 BearStrategy 空仓避险，并尝试接针
+    # 11月后:  它会再次切入 BearStrategy 锁住利润
+
+    engine = BacktestEngine(
+        symbol="BTC/USDT",
+        start_date="2021-01-01 00:00:00",
+        end_date="2022-01-01 00:00:00"
+    )
+    engine.run()
