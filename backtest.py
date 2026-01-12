@@ -332,16 +332,10 @@ class BacktestEngine:
 
 
 if __name__ == "__main__":
-    print("🔥 正在进行 2021 史诗级全能测试...")
-
-    # 策略路由 v20 会读取上面生成的 csv
-    # 1月-4月: 它会用 BullStrategy 狂赚
-    # 5月-7月: 它会用 BearStrategy 空仓避险，并尝试接针
-    # 11月后:  它会再次切入 BearStrategy 锁住利润
-
+    # 预期：极少开单，空仓为主，躲过 LUNA 和 FTX 两次腰斩
     engine = BacktestEngine(
         symbol="BTC/USDT",
-        start_date="2021-01-01 00:00:00",
-        end_date="2022-01-01 00:00:00"
+        start_date="2023-01-01 00:00:00",
+        end_date="2024-01-01 00:00:00"
     )
     engine.run()

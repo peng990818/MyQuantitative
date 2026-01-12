@@ -6,168 +6,165 @@ from modules.analysis.technical import TechnicalAnalyzer
 
 class SniperRouterStrategy(BaseStrategy):
     def __init__(self):
-        # 严格遵循 BaseStrategy 接口
-        super().__init__(name="Sniper_Router_v20_AI")
+        # v21: 技术否决版 (Trust but Verify)
+        # AI 定性，技术定量。如果技术面不支持 AI 的判断，拒绝执行。
+        super().__init__(name="Sniper_Router_v21_Veto")
         self.ta = TechnicalAnalyzer()
 
-    # ==================================================================
-    # 步骤 1: 统一计算所有需要的指标 (数据仓库)
-    # ==================================================================
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self.ta.calculate_indicators(df)
 
-        # --- A. 趋势指纹 (用于识别体制) ---
+        # 1. 趋势指纹
         df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
         df['EMA_55'] = df['close'].ewm(span=55, adjust=False).mean()
-        df['EMA_5'] = df['close'].ewm(span=5, adjust=False).mean()  # 短期生命线
+        df['EMA_5'] = df['close'].ewm(span=5, adjust=False).mean()
 
-        # 计算斜率 (判断趋势强弱)
+        # 2. 斜率 (判断趋势力度)
         df['Slope_200'] = df['EMA_200'] - df['EMA_200'].shift(5)
 
-        # --- B. 熊市防御网 (99周期布林) ---
+        # 3. 熊市布林 (99)
         win_long = 99
         base_long = df['close'].rolling(window=win_long).mean()
         std_long = df['close'].rolling(window=win_long).std()
         df['BB_Long_Lower'] = base_long - (2.0 * std_long)
 
-        # --- C. 震荡/牛市回调网 (20周期布林) ---
+        # 4. 震荡布林 (20)
         win_short = 20
         base_short = df['close'].rolling(window=win_short).mean()
         std_short = df['close'].rolling(window=win_short).std()
         df['BB_Short_Mid'] = base_short
         df['BB_Short_Lower'] = base_short - (2.0 * std_short)
-        # 带宽 (用于过滤死鱼盘)
         df['BB_Short_Width'] = (base_short + 2 * std_short - (base_short - 2 * std_short)) / base_short
 
         return df
 
-    # ==================================================================
-    # 步骤 2: 核心路由逻辑 (司令部)
-    # ==================================================================
     def check_signal(self, row: pd.Series) -> dict:
-        """
-        AI 决策层: 判断当前属于什么体制，然后下发给具体的逻辑模块执行
-        """
         # 0. 基础数据准备
         slope = row.get('Slope_200', 0)
         if pd.isna(slope): return {'action': None}
 
-        # 1. 宏观熔断 (全局风控)
-        # 哪怕 AI 说可以买，如果正在自由落体，也必须强制空仓
-        if slope < -10:
-            return {'action': None}
+        # 1. 宏观熔断 (最高级风控)
+        if slope < -10: return {'action': None}
 
-        # 2. 体制识别 (Regime Identification)
-        # 这里模拟 AI 的判断。如果你接入了 GPT，这里就是 self.ask_gpt(row)
-        regime = self._determine_regime(row)
+        # 2. 获取 AI 观点 (优先读取 CSV 注入的字段)
+        ai_regime = row.get('AI_REGIME')
+        if not ai_regime:
+            ai_regime = self._determine_regime_fallback(row)
 
-        # 3. 策略分发
+        # 3. 🔥 技术否决层 (The Veto Layer) 🔥
+        # 即使 AI 说是牛市，如果技术面已经崩了，也不许做多
+        actual_regime = self._technical_veto(row, ai_regime)
+
+        # 4. 策略分发
         signal = {'action': None}
 
-        if regime == "BULL_TREND":
-            # 牛市：主攻趋势，辅攻震荡(回调)
+        if actual_regime == "BULL_TREND":
             signal = self._strategy_bull_trend(row)
             if not signal['action']:
-                signal = self._strategy_bull_correction(row)  # 牛市里的震荡策略
+                signal = self._strategy_bull_correction(row)
 
-        elif regime == "BEAR_CRASH":
-            # 熊市：严防死守，只接飞刀
+        elif actual_regime == "BEAR_CRASH":
             signal = self._strategy_bear_reversal(row)
 
-        elif regime == "SHOCK_SIDEWAYS":
-            # 震荡市：高抛低吸，但参数要严格
+        elif actual_regime == "SHOCK_SIDEWAYS":
             signal = self._strategy_sideways(row)
 
         return signal
 
     # ==================================================================
-    # 辅助方法: 体制识别器 (模拟 AI 大脑)
+    # 🔥 核心新功能: 技术否决器
     # ==================================================================
-    def _determine_regime(self, row):
+    def _technical_veto(self, row, ai_regime):
+        """
+        AI 说的话，必须经过技术面的验证。
+        如果严重背离，强制降级为 'WAIT' (空仓)。
+        """
+        close = row['close']
+        ema_200 = row['EMA_200']
+        slope = row['Slope_200']
+
+        # 场景 A: AI 说是牛市，但价格跌破 EMA 200 (技术性熊市)
+        if ai_regime == "BULL_TREND":
+            if close < ema_200:
+                # 拒绝执行牛市策略，转为观望 (或者降级为震荡)
+                return "WAIT"
+            return "BULL_TREND"
+
+        # 场景 B: AI 说是熊市，但价格还在 EMA 200 之上 (多头不死)
+        if ai_regime == "BEAR_CRASH":
+            if close > ema_200:
+                # 此时接飞刀太危险(可能是上涨中继)，不如观望
+                return "WAIT"
+            return "BEAR_CRASH"
+
+        # 场景 C: AI 说是震荡，但正在暴跌 (Slope < -5)
+        if ai_regime == "SHOCK_SIDEWAYS":
+            if slope < -5:
+                return "WAIT"  # 正在跌，别接飞刀
+            return "SHOCK_SIDEWAYS"
+
+        return "WAIT"
+
+    # ==================================================================
+    # 辅助: 没有 CSV 时的回退逻辑
+    # ==================================================================
+    def _determine_regime_fallback(self, row):
         ema_55 = row.get('EMA_55')
         ema_200 = row.get('EMA_200')
         slope = row.get('Slope_200')
-        adx = row.get('ADX_14', 0)
-
-        # 金叉 + 斜率向上 = 牛市
-        if (ema_55 > ema_200) and (slope > 0):
-            return "BULL_TREND"
-
-        # 死叉 + 斜率向下 = 熊市
-        if (ema_55 < ema_200) and (slope < 0):
-            return "BEAR_CRASH"
-
-        # 其他情况视为震荡/过渡期
+        if (ema_55 > ema_200) and (slope > 0): return "BULL_TREND"
+        if (ema_55 < ema_200) and (slope < 0): return "BEAR_CRASH"
         return "SHOCK_SIDEWAYS"
 
     # ==================================================================
-    # 策略 A: 牛市趋势策略 (Aggressive)
+    # 策略 A: 牛市策略 (放宽止损，加强确认)
     # ==================================================================
     def _strategy_bull_trend(self, row):
-        """
-        逻辑：追涨。
-        严格指标：回踩 EMA 55 + RSI 健康
-        """
         close = row['close']
         ema_55 = row['EMA_55']
         rsi = row['RSI_14']
 
         signal = {'action': None}
 
-        # 严格判断:
-        # 1. 回踩幅度不能太深 (EMA 55 附近 1.5%)
+        # 逻辑：回踩 EMA 55
         hit_support = close <= ema_55 * 1.015
-        # 2. RSI 不能过热也不能过冷 (牛市里 RSI 40-60 是支撑区)
-        rsi_valid = 40 < rsi < 65
+        # 修正：牛市里 RSI 可以高一点，太低反而说明趋势坏了
+        rsi_valid = 40 < rsi < 70
 
         if hit_support and rsi_valid:
             signal['action'] = "BUY"
-            signal['sl_pct'] = 0.05
-            # 牛市特权：开启移动止盈
+            signal['sl_pct'] = 0.07  # 🔥 放大止损到 7%
             signal['use_trailing'] = True
-            signal['trailing_start'] = 0.04
-            signal['trailing_drop'] = 0.025
-            signal['tp_pct'] = 0.50  # 虚设上限
+            signal['trailing_start'] = 0.05
+            signal['trailing_drop'] = 0.03
+            signal['tp_pct'] = 0.50
 
         return signal
 
-    # ==================================================================
-    # 策略 B: 牛市回调/震荡策略 (Moderate)
-    # ==================================================================
     def _strategy_bull_correction(self, row):
-        """
-        逻辑：牛市里的深回调（送钱机会）。
-        严格指标：触碰 20 布林下轨
-        """
         close = row['close']
         bb_short_lower = row['BB_Short_Lower']
         rsi = row['RSI_14']
 
         signal = {'action': None}
 
-        # 牛市里跌破 20 布林下轨，通常是假摔
         hit_lower = close <= bb_short_lower * 1.005
-        rsi_oversold = rsi < 45  # 牛市里 45 就算超卖了
+        rsi_oversold = rsi < 45
 
         if hit_lower and rsi_oversold:
             signal['action'] = "BUY"
-            signal['sl_pct'] = 0.04
-            # 同样开启移动止盈，防止回调变成主升浪
+            signal['sl_pct'] = 0.06  # 🔥 放大止损
             signal['use_trailing'] = True
-            signal['trailing_start'] = 0.03
-            signal['trailing_drop'] = 0.02
+            signal['trailing_start'] = 0.04
+            signal['trailing_drop'] = 0.025
             signal['tp_pct'] = 0.20
 
         return signal
 
     # ==================================================================
-    # 策略 C: 熊市反转策略 (Defensive)
+    # 策略 B: 熊市策略 (极其保守)
     # ==================================================================
     def _strategy_bear_reversal(self, row):
-        """
-        逻辑：绝对防御。只接历史大底。
-        严格指标：跌破 99 布林 + RSI < 25 + EMA 5 确认
-        """
         close = row['close']
         bb_long_lower = row['BB_Long_Lower']
         rsi = row['RSI_14']
@@ -175,30 +172,23 @@ class SniperRouterStrategy(BaseStrategy):
 
         signal = {'action': None}
 
-        # 1. 深度必须够 (99下轨)
+        # 必须是极值中的极值
         is_deep = close < bb_long_lower
-        # 2. 情绪必须恐慌 (RSI < 25) - 比牛市严格得多
-        is_panic = rsi < 25
-        # 3. 🔥 必须有止跌迹象 (站上 EMA 5) - 物理锁，防止接飞刀
-        is_stabilized = close > ema_5
+        is_panic = rsi < 20  # 修正：熊市不恐慌不买
+        is_stabilized = close > ema_5  # 必须站稳 5日线
 
         if is_deep and is_panic and is_stabilized:
             signal['action'] = "BUY"
-            signal['sl_pct'] = 0.06
-            # 熊市不做移动止盈，快进快出
+            signal['sl_pct'] = 0.05
             signal['use_trailing'] = False
             signal['tp_pct'] = 0.10
 
         return signal
 
     # ==================================================================
-    # 策略 D: 纯震荡市策略 (Sniper)
+    # 策略 C: 震荡策略 (只做宽幅震荡)
     # ==================================================================
     def _strategy_sideways(self, row):
-        """
-        逻辑：垃圾时间刷单。
-        严格指标：ADX 低 + 带宽够
-        """
         close = row['close']
         bb_short_lower = row['BB_Short_Lower']
         bb_short_mid = row['BB_Short_Mid']
@@ -208,22 +198,18 @@ class SniperRouterStrategy(BaseStrategy):
 
         signal = {'action': None}
 
-        # 1. 必须是真震荡 (ADX < 25)
         if adx > 25: return signal
-        # 2. 必须有肉吃 (带宽 > 3%)
-        if bb_width < 0.03: return signal
+        if bb_width < 0.04: return signal  # 🔥 修正：太窄不做 (去掉手续费没钱赚)
 
-        # 3. 严格的高抛低吸
         hit_lower = close <= bb_short_lower * 1.005
-        rsi_weak = rsi < 40  # 震荡市要求 RSI 更低才安全
+        rsi_weak = rsi < 40
 
         if hit_lower and rsi_weak:
             signal['action'] = "BUY"
-            signal['sl_pct'] = 0.03  # 窄止损
+            signal['sl_pct'] = 0.04  # 🔥 放大止损
             signal['use_trailing'] = False
 
-            # 动态止盈：回归中轨
             dist_to_mid = (bb_short_mid - close) / close
-            signal['tp_pct'] = max(0.015, min(dist_to_mid * 0.9, 0.04))
+            signal['tp_pct'] = max(0.015, min(dist_to_mid * 0.9, 0.05))
 
         return signal
