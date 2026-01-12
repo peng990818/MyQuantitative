@@ -4,6 +4,7 @@ import socks
 from email.mime.text import MIMEText
 from email.header import Header
 from datetime import datetime
+import contextlib
 from utils.config_loader import ConfigLoader
 from utils.proxy_manager import ProxyManager
 from utils.logger import logger
@@ -14,104 +15,106 @@ class EmailNotifier:
         self.cfg = ConfigLoader()
         self.proxy_mgr = ProxyManager(self.cfg)
 
+        # ==========================================
+        # 1. 读取基础配置 (通常在 config.yaml)
+        # ==========================================
+        # 这些是非敏感信息，通常放在 config.yaml 的 notification.email 下
         self.enabled = self.cfg.get("notification.email.enabled", False)
         self.smtp_server = self.cfg.get("notification.email.smtp_server", "smtp.gmail.com")
         self.smtp_port = self.cfg.get("notification.email.smtp_port", 587)
 
+        # ==========================================
+        # 2. 读取敏感信息 (你的 secrets.yaml)
+        # ==========================================
+        # 🔥 修正点：根据你的描述，这些在 secrets.yaml 的根节点 email 下
         self.sender = self.cfg.get("email.sender")
-        self.password = self.cfg.get("email.password")
+        self.password = self.cfg.get("email.password")  # 应用专用密码
         self.receiver = self.cfg.get("email.receiver")
 
-    def send_alert(self, type_, symbol, price, qty, details, pnl_pct=0.0):
+        # 兼容性尝试：如果根节点没读到，试着去 notification.email 下读（防止有人放混了）
+        if not self.sender:
+            self.sender = self.cfg.get("notification.email.sender")
+        if not self.password:
+            self.password = self.cfg.get("notification.email.password")
+        if not self.receiver:
+            self.receiver = self.cfg.get("notification.email.receiver")
+
+        # ==========================================
+        # 3. 安全检查 (防止 NoneType 崩溃)
+        # ==========================================
+        if self.enabled:
+            # 只要有一个关键信息缺失，就强制禁用，防止程序崩溃
+            if not self.sender or not self.password or not self.receiver:
+                logger.warning("⚠️ [Email] 账号/密码/接收人配置缺失！邮件功能已自动禁用。")
+                logger.warning(f"   (读取到的 Sender: {self.sender})")  # 方便调试
+                self.enabled = False
+            else:
+                logger.info(f"📧 [Email] 服务已就绪 (Sender: {self.sender})")
+
+    def send_alert(self, title, message):
         """
-        发送交易提醒
-        :param type_: "BUY" | "TP"(止盈) | "SL"(止损)
+        [通用接口] 适配 Engine 的调用
+        :param title: 邮件标题
+        :param message: 邮件正文
         """
         if not self.enabled:
             return
 
-        # 1. 设置图标和标题
-        icon_map = {
-            "BUY": "🚀 [买入]",
-            "TP": "💰 [止盈]",
-            "SL": "🛑 [止损]"
-        }
-        icon = icon_map.get(type_, "📢")
-        subject = f"{icon} {symbol} 触发提醒"
+        full_subject = f"{title} [{datetime.now().strftime('%H:%M')}]"
+        full_body = f"{message}\n\n------------------\n🤖 Sniper Bot v2.0"
 
-        # 2. 盈亏描述
-        pnl_info = ""
-        if type_ in ["TP", "SL"]:
-            emoji = "🎉" if pnl_pct > 0 else "😭"
-            pnl_info = f"📈 本次盈亏: {pnl_pct:+.2f}% {emoji}"
+        self._send_email_safe(full_subject, full_body)
 
-        # 3. 邮件正文
-        body = f"""
-        QuantBot v2.0 交易报告
-        ================================
-        动作: {type_}
-        时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        标的: {symbol}
-        价格: {price:.2f} USDT
-        数量: {qty}
-        --------------------------------
-        {pnl_info}
-
-        🧠 策略分析:
-        {details}
-        ================================
+    def _send_email_safe(self, subject, body):
         """
+        使用上下文管理器安全地挂载代理发送
+        """
+        msg = MIMEText(body, 'plain', 'utf-8')
+        msg['From'] = self.sender
+        msg['To'] = self.receiver
+        msg['Subject'] = Header(subject, 'utf-8')
 
-        self._send_email_via_proxy(subject, body)
+        # 获取代理信息
+        proxy_host = self.proxy_mgr.host
+        proxy_port = self.proxy_mgr.port
 
-    def _send_email_via_proxy(self, subject, body):
-        """通过代理发送 Gmail"""
-        # 保存原始 socket 环境
+        # 临时挂载代理，发送完立即还原
+        with self._proxy_socket_context(proxy_host, proxy_port):
+            try:
+                server = smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=10)
+                server.starttls()
+                server.login(self.sender, self.password)  # 如果这里还是 None，上面的检查会拦截，不会走到这
+                server.sendmail(self.sender, [self.receiver], msg.as_string())
+                server.quit()
+                logger.info(f"📧 [Email] 发送成功: {subject}")
+            except Exception as e:
+                logger.error(f"❌ [Email] 发送失败: {e}")
+
+    @contextlib.contextmanager
+    def _proxy_socket_context(self, host, port):
         original_socket = socket.socket
-
         try:
-            # === 1. 强行挂载 SOCKS5 代理 ===
-            # Gmail 在国内必须翻墙才能连上 SMTP
-            proxy_url = self.proxy_mgr.get_proxy_url()
-            if proxy_url:
-                # 假设 proxy_url 是 http://127.0.0.1:7890
-                # 我们需要解析出 IP 和 端口
-                p_host = self.proxy_mgr.host
-                p_port = int(self.proxy_mgr.port)
-
-                # 关键黑魔法：把 Python 的 socket 替换成 socks
-                socks.set_default_proxy(socks.SOCKS5, p_host, p_port)
+            if host and port:
+                socks.set_default_proxy(socks.SOCKS5, host, int(port))
                 socket.socket = socks.socksocket
-                # logger.debug(f"🔌 [Email] 已挂载代理: {p_host}:{p_port}")
-
-            # === 2. 发送邮件 ===
-            msg = MIMEText(body, 'plain', 'utf-8')
-            msg['From'] = self.sender
-            msg['To'] = self.receiver
-            msg['Subject'] = Header(subject, 'utf-8')
-
-            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
-            server.starttls()  # Gmail 必须启用 TLS
-            server.login(self.sender, self.password)
-            server.sendmail(self.sender, [self.receiver], msg.as_string())
-            server.quit()
-
-            logger.info(f"📧 [Email] 发送成功: {subject}")
-
-        except Exception as e:
-            logger.error(f"❌ [Email] 发送失败: {e}")
-            logger.warning("💡 提示: 请检查是否开启了 Gmail 应用专用密码，以及代理是否通畅。")
-
+            yield
         finally:
-            # === 3. 还原 socket，防止影响其他模块 ===
             socket.socket = original_socket
 
 
+# === 单元测试 ===
 if __name__ == "__main__":
-    # 简单的测试代码
     import sys, os
 
     sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    print("📧 正在测试 Gmail 发送...")
+
+    print("📧 正在测试邮件发送 (读取 secrets.yaml)...")
     notifier = EmailNotifier()
-    notifier.send_alert("BUY", "BTC/USDT", 95000, 0.01, "测试邮件功能")
+
+    if notifier.enabled:
+        notifier.send_alert(
+            title="🚀 配置读取测试",
+            message="如果你收到这封信，说明 secrets.yaml 读取路径修复成功！"
+        )
+    else:
+        print("❌ 邮件功能未启用，请检查日志里的警告信息。")

@@ -1,4 +1,4 @@
-name: quant            # 🔥 保持原名
+name: quant
 channels:
   - conda-forge
   - defaults
@@ -7,19 +7,32 @@ dependencies:
   - pip
 
   # === 核心计算与绘图 (Conda) ===
-  - pandas<2.0.0
-  - "numpy<2.0.0"      # 🔒 锁死版本，防止 pandas-ta 报错
-  - matplotlib         # 📊 [新增] v2.0 回测绘图必备
-  - pyyaml             # ⚙️ [新增] 解析 config.yaml 必备
+  - pandas<2.0.0       # 核心数据处理
+  - "numpy<2.0.0"      # 锁定版本以防兼容性问题
+  - matplotlib         # 基础绘图
+  - pyyaml             # 配置文件读取
 
   # === 扩展库 (Pip) ===
   - pip:
-      - ccxt                # 交易所接口
-      - python-dotenv       # 环境变量
-      - requests            # 网络请求
-      - pysocks             # 代理支持
-      - schedule            # 定时任务
+      # 1. 交易与行情
+      - ccxt                # 对接 OKX/Binance
 
-      # === AI 模型支持 ===
-      - openai              # DeepSeek / OpenAI
-      - google-generativeai # Gemini
+      # 2. 回测绘图
+      - mplfinance          # 🕯️ 回测结束画 K 线图专用
+
+      # 3. 网络与代理
+      - requests            # 基础请求
+      - httpx               # ⚡ DeepSeek SDK 底层依赖 / 异步请求
+      - pysocks             # 🔌 代理支持 (邮件/交易所/API 翻墙必备)
+      - python-dotenv       # 加载 .env 和 secrets.yaml
+
+      # 4. 数据源
+      - feedparser          # 📡 解析 RSS 新闻源 (RSSNewsLoader)
+
+      # 5. AI 模型支持
+      - openai              # DeepSeek (兼容 OpenAI SDK)
+      - google-generativeai # Gemini SDK
+
+      # 6. 工具
+      - schedule            # 定时任务 (保留备用)
+      - tqdm                # 进度条

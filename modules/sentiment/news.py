@@ -1,100 +1,69 @@
-import os
-
-import requests
+import feedparser
+from datetime import datetime
 import time
-from utils.config_loader import ConfigLoader
-from utils.proxy_manager import ProxyManager
+from utils.logger import logger
 
 
-class NewsFetcher:
+class RSSNewsLoader:
     def __init__(self):
-        self.cfg = ConfigLoader()
-        self.api_key = self.cfg.get("news_keys.cryptopanic")
-        self.base_url = "https://cryptopanic.com/api/developer/v2/posts/"
+        # 顶级加密货币媒体 RSS 源列表
+        self.rss_sources = [
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",  # CoinDesk (权威)
+            "https://cointelegraph.com/rss",  # Cointelegraph (量大)
+            "https://theblock.co/rss",  # The Block (深度)
+            "https://decrypt.co/feed"  # Decrypt (即时)
+        ]
 
-        # 从 ProxyManager 获取标准代理字典
-        self.proxies = ProxyManager(self.cfg).get_proxies()
+    def get_latest_news(self, limit=10):
+        """
+        聚合多个 RSS 源，按时间排序，返回最新的 N 条
+        """
+        all_news = []
 
-    def get_latest_news(self, symbol="BTC", limit=5):
-        if not self.api_key:
-            return "No news API key configured."
-
-        currency = symbol.split('/')[0]
-        # 1. 尝试重要新闻
-        news = self._fetch(currency, "important", limit)
-        if news: return news
-
-        # 2. 强制冷却 (防 429)
-        time.sleep(1)
-
-        # 3. 尝试普通新闻
-        return self._fetch(currency, None, limit)
-
-    def _fetch(self, currency, filter_mode, limit):
-        params = {
-            "auth_token": self.api_key,
-            "currencies": currency,
-            "kind": "news",
-            "public": "true"
-        }
-        if filter_mode: params["filter"] = filter_mode
-
-        headers = {"User-Agent": "QuantBot/v2.0"}
-
-        # 重试机制
-        for attempt in range(3):
+        for url in self.rss_sources:
             try:
-                resp = requests.get(
-                    self.base_url,
-                    params=params,
-                    headers=headers,
-                    proxies=self.proxies,  # 🔥 自动注入代理
-                    timeout=10
-                )
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    results = data.get('results', [])
-                    if not results: return None
-
-                    summary = []
-                    for item in results[:limit]:
-                        title = item.get('title')
-                        date = item.get('published_at', '')[:16].replace('T', ' ')
-                        icon = "🔥" if filter_mode == "important" else "📢"
-                        summary.append(f"- {icon} [{date}] {title}")
-                    return "\n".join(summary)
-
-                elif resp.status_code == 429:
-                    wait = 2 * (attempt + 1)
-                    print(f"⏳ [News] 触发限流，等待 {wait}s...")
-                    time.sleep(wait)
+                feed = feedparser.parse(url)
+                if not feed.entries:
                     continue
 
+                for entry in feed.entries[:5]:  # 每个源只取最新的 5 条，减少处理量
+                    # 获取发布时间 (处理不同 RSS 的时间格式)
+                    published_time = entry.get('published_parsed', time.gmtime())
+                    timestamp = time.mktime(published_time)
+
+                    # 组合数据
+                    source_name = self._extract_source_name(url)
+                    title = entry.title
+
+                    all_news.append({
+                        "timestamp": timestamp,
+                        "text": f"[{source_name}] {title}",
+                        "link": entry.link
+                    })
             except Exception as e:
-                print(f"⚠️ News Fetch Error: {e}")
-                return None
-        return None
+                logger.error(f"❌ RSS 读取失败 {url}: {e}")
+                continue
+
+        # 1. 按时间倒序排列 (最新的在前)
+        all_news.sort(key=lambda x: x['timestamp'], reverse=True)
+
+        # 2. 截取前 N 条
+        final_list = [item['text'] for item in all_news[:limit]]
+
+        logger.info(f"📡 从 RSS 聚合了 {len(final_list)} 条最新新闻")
+        return final_list
+
+    def _extract_source_name(self, url):
+        if "coindesk" in url: return "CoinDesk"
+        if "cointelegraph" in url: return "CoinTelegraph"
+        if "theblock" in url: return "TheBlock"
+        if "decrypt" in url: return "Decrypt"
+        return "News"
+
 
 if __name__ == "__main__":
-    import sys
-
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-    print("📰 正在测试 NewsFetcher...")
-    try:
-        fetcher = NewsFetcher()
-        print("⏳ 正在抓取 BTC 新闻...")
-
-        # 抓取 3 条
-        news_text = fetcher.get_latest_news("BTC", limit=3)
-
-        if news_text and "No news" not in news_text:
-            print("✅ 抓取成功:\n" + "-" * 30)
-            print(news_text)
-            print("-" * 30)
-        else:
-            print(f"⚠️ 未抓取到内容 (原因: {news_text})")
-
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
+    loader = RSSNewsLoader()
+    news = loader.get_latest_news()
+    print("\n🌍 最新 RSS 聚合新闻:")
+    for n in news:
+        print(n)

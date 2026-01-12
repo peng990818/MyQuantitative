@@ -332,7 +332,6 @@ class BacktestEngine:
 
 
 if __name__ == "__main__":
-    # 预期：极少开单，空仓为主，躲过 LUNA 和 FTX 两次腰斩
     engine = BacktestEngine(
         symbol="BTC/USDT",
         start_date="2023-01-01 00:00:00",

@@ -6,11 +6,7 @@ run_mode: "PAPER"  # PAPER(模拟) | REAL(实盘)
 log_level: "INFO"
 
 # === 交易标的与周期 ===
-symbols:
-  - "BTC/USDT"
-  # - "ETH/USDT"
-  # - "SOL/USDT" # 支持列表扩展
-
+symbols: ["BTC/USDT"]
 timeframe: "1h"
 
 # === 资金管理 (复利系统) ===
@@ -61,3 +57,36 @@ notification:
 risk_management:
   stop_loss: 0.03
   take_profit: 0.05
+
+# ==========================================
+# 🎯 策略参数仓库 (Strategy Parameters)
+# ==========================================
+strategy_params:
+  # 📋 定义高波动币种列表 (自动匹配 Volatile 参数)
+  volatile_symbols: ["ETH", "SOL", "DOGE", "PEPE", "SHIB", "AVAX", "NEAR"]
+
+  # 🔹 模板 A: 标准参数 (适用于 BTC)
+  default:
+    sl_bull: 0.07           # 牛市止损 7%
+    sl_bear: 0.05           # 熊市止损 5%
+    sl_shock: 0.04          # 震荡止损 4%
+
+    bull_rsi_entry: 70      # 牛市 RSI 入场上限
+    bear_rsi_entry: 20      # 熊市 RSI 入场上限
+    shock_rsi_entry: 40     # 震荡 RSI 入场上限
+
+    shock_min_width: 0.04   # 震荡最小布林带宽
+    ema_entry_buffer: 1.015 # EMA 挂单缓冲 (1.5%)
+
+  # 🔸 模板 B: 高波动参数 (适用于山寨币)
+  volatile:
+    sl_bull: 0.12           # 放宽到 12%
+    sl_bear: 0.08
+    sl_shock: 0.06
+
+    bull_rsi_entry: 75
+    bear_rsi_entry: 25
+    shock_rsi_entry: 45
+
+    shock_min_width: 0.06
+    ema_entry_buffer: 1.025

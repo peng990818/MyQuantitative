@@ -2,47 +2,66 @@ import json
 import os
 from utils.logger import logger
 
+
 class StateManager:
-    def __init__(self, filename="trade_state.json"):
-        # 状态文件保存在 data/ 目录下
-        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.file_path = os.path.join(base_path, 'data', filename)
-        self.state = self._load_state()
+    def __init__(self, file_path="data/state.json"):
+        self.file_path = file_path
+        # 确保目录存在
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        self.data = self._load_state()
 
     def _load_state(self):
-        if not os.path.exists(self.file_path):
-            return {}
-        try:
-            with open(self.file_path, 'r') as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        """加载状态，如果没有文件则初始化默认值"""
+        if os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"❌ 读取状态文件失败: {e}")
+
+        # 默认初始状态
+        return {
+            "balance": 10000.0,  # 💰 默认虚拟本金 10000 U
+            "positions": {}  # 持仓字典
+        }
 
     def _save_state(self):
+        """保存状态到磁盘"""
         try:
-            os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
             with open(self.file_path, 'w') as f:
-                json.dump(self.state, f, indent=4)
+                json.dump(self.data, f, indent=4)
         except Exception as e:
-            logger.error(f"❌ 保存持仓状态失败: {e}")
+            logger.error(f"❌ 保存状态失败: {e}")
 
-    def update_position(self, symbol, entry_price, qty):
-        """记录买入信息"""
-        self.state[symbol] = {
-            "holding": True,
-            "entry_price": float(entry_price),
-            "qty": float(qty)
+    # ==========================
+    # 💰 余额管理 (影子模式专用)
+    # ==========================
+    def get_balance(self):
+        return self.data.get("balance", 10000.0)
+
+    def update_balance(self, new_balance):
+        self.data["balance"] = new_balance
+        self._save_state()
+
+    # ==========================
+    # 📦 持仓管理
+    # ==========================
+    def get_position(self, symbol):
+        return self.data["positions"].get(symbol)
+
+    def update_position(self, symbol, entry_price, qty, **kwargs):
+        """开仓：记录持仓信息"""
+        self.data["positions"][symbol] = {
+            "symbol": symbol,
+            "entry_price": entry_price,
+            "qty": qty,
+            "sl_pct": kwargs.get('sl_pct', 0.05),
+            "timestamp": kwargs.get('timestamp')
         }
         self._save_state()
-        logger.info(f"📝 [State] 已记录持仓: {symbol} @ {entry_price}")
 
     def clear_position(self, symbol):
-        """卖出后清除记录"""
-        if symbol in self.state:
-            del self.state[symbol]
+        """平仓：删除持仓信息"""
+        if symbol in self.data["positions"]:
+            del self.data["positions"][symbol]
             self._save_state()
-            logger.info(f"📝 [State] 已清除持仓: {symbol}")
-
-    def get_position(self, symbol):
-        """查询是否持有"""
-        return self.state.get(symbol, None)
