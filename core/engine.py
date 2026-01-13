@@ -118,15 +118,34 @@ class TradingEngine:
             news = self.news_loader.get_latest_news(limit=5)
             ai_res = self.ai_analyzer.analyze(symbol, confirmed_row['close'], tech_summary, news)
 
+            regime = ai_res.get('regime', 'SHOCK_SIDEWAYS')
+            confidence = ai_res.get('confidence', 0)
+            reason = ai_res.get('reasoning', '无理由')
+            logger.info(f"🧠 [AI结果] {regime} (信心:{confidence})")
+            logger.info(f"   📝 理由: {reason}")
+
             row_for_strategy = confirmed_row.copy()
             row_for_strategy['AI_REGIME'] = ai_result = ai_res.get('regime', 'SHOCK_SIDEWAYS')
 
             signal = strategy.check_signal(row_for_strategy)
 
-            if signal.get('action') == "BUY":
+            # 🔥🔥🔥 [修正] 处理 None 值的打印逻辑 🔥🔥🔥
+            raw_action = signal.get('action')
+
+            # 如果 raw_action 是 None (空) 或者 "WAIT" (字符串)，都算观望
+            if not raw_action or raw_action == "WAIT":
+                # 尝试获取拒绝理由 (部分策略逻辑可能会返回 reason)
+                wait_reason = signal.get('reason', '未触发开仓条件')
+                logger.info(f"🚦 [策略判定] 观望 (WAIT) - {wait_reason}")
+            else:
+                logger.info(f"🚦 [策略判定] 信号触发: {raw_action} !!!")
+            # 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+
+            # 下面的判断也要跟着改，用 raw_action
+            if raw_action == "BUY":
                 self._execute_open(symbol, current_price, signal, ai_res.get('reasoning'))
-            elif signal.get('action') == "SELL":
-                self._execute_close(symbol, current_price, f"策略卖出: {ai_result}")
+            elif raw_action == "SELL":
+                self._execute_close(symbol, current_price, f"策略卖出: {regime}")
 
             self.last_candle_time[symbol] = current_candle_ts
 

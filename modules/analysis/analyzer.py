@@ -65,11 +65,10 @@ class MarketRegimeAnalyzer:
 
     def _build_prompts(self, symbol, price, indicators, news):
         """
-        构造 Prompt，加入标的身份信息
+        构造 Prompt：保留高阶分析逻辑，仅通过【示例】约束格式
         """
 
-        # 1. 简单的资产画像注入 (Prompt Engineering)
-        # 根据标的名称，给 AI 一些背景提示，激活它的先验知识
+        # 1. 资产画像注入 (保留你的逻辑)
         asset_context = ""
         if "BTC" in symbol:
             asset_context = "(属性: 数字黄金, 避险/风险双重属性, 市场风向标)"
@@ -80,18 +79,27 @@ class MarketRegimeAnalyzer:
 
         news_str = "\n".join([f"- {n}" for n in news])
 
+        # 2. System Prompt (增加 JSON 示例)
         system_prompt = f"""
         你是一个严谨的加密货币量化交易决策系统。
         你当前正在分析的标的是：【{symbol}】 {asset_context}。
 
-        请遵循以下逻辑：
-        1. 【相关性过滤】：在阅读新闻时，重点关注与 {symbol} 直接相关，或宏观（美联储/监管）相关的新闻。忽略无关币种的新闻。
+        请遵循以下分析逻辑：
+        1. 【相关性过滤】：在阅读新闻时，重点关注与 {symbol} 直接相关，或宏观（美联储/监管）相关的新闻。
         2. 【性格匹配】：{symbol} 的波动率特性应纳入考量。
-        3. 【震荡常态】：除非有针对 {symbol} 的明确驱动力，否则默认震荡。
+        3. 【震荡常态】：除非有针对 {symbol} 的明确强驱动力，否则优先判断为震荡。
 
-        必须返回纯 JSON 格式。
+        【输出要求】
+        请直接返回 JSON 格式，不要包含 Markdown 标记，不要嵌套。
+        必须严格参考以下结构：
+        {{
+            "regime": "BULL_TREND",  // 只能是: BULL_TREND, BEAR_CRASH, SHOCK_SIDEWAYS
+            "confidence": 85,        // 0-100 的整数
+            "reasoning": "简述判断理由，例如：虽然有减半利好，但宏观加息预期压制，判断为宽幅震荡。"
+        }}
         """
 
+        # 3. User Prompt (保持原样)
         user_prompt = f"""
         【当前市场数据 ({symbol})】
         - 价格: {price}
