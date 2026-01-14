@@ -81,6 +81,8 @@ class BacktestEngine:
         # 记录 AI 历史状态用于绘图
         self.ai_regime_history = []
 
+        self.stop_loss_cooldown_until = None
+
     def fetch_and_prepare(self):
         # ... (保持不变) ...
         safe_symbol = self.symbol.replace('/', '_')
@@ -206,17 +208,65 @@ class BacktestEngine:
         return False
 
     def _execute_buy(self, t, p, sig):
-        qty = self.pos_manager.calculate_buy_size(p, self.usdt)
+        # ============================================================
+        # 🔥 [新增] 1. 冷却期熔断检查 (Guard Clause)
+        # ============================================================
+        # 如果当前时间还在"止损冷却期"内，直接强制拒绝开仓
+        if self.stop_loss_cooldown_until and t < self.stop_loss_cooldown_until:
+            # (可选) 打印一条日志方便调试
+            # print(f"❄️ [冷却中] 拒绝开仓，直到 {self.stop_loss_cooldown_until}")
+            return
+
+        # ============================================================
+        # 🔥 [新增] 2. 动态仓位控制 (Dynamic Position Sizing)
+        # ============================================================
+        # 获取当前策略的 Regime (你是根据什么信号买的？)
+        # 注意：需要确保 strategy.py 返回的 sig 字典里带了 'regime'
+        strategy_regime = sig.get('regime', 'SHOCK_SIDEWAYS')
+
+        # 定义仓位权重
+        size_multiplier = 1.0
+        if strategy_regime == 'BULL_TREND':
+            size_multiplier = 1.0  # 牛市: 满仓 (98%)
+        elif strategy_regime == 'SHOCK_SIDEWAYS':
+            size_multiplier = 0.5  # 震荡: 半仓 (49%)
+        elif strategy_regime == 'BEAR_CRASH':
+            size_multiplier = 0.25  # 熊市: 1/4仓 (24.5%)，只接深针
+
+        # 计算本次允许使用的最大资金
+        # 我们基于账户总 USDT 进行比例调整
+        available_cash = self.usdt * size_multiplier
+
+        # ============================================================
+        # 3. 资金计算 (使用调整后的 available_cash)
+        # ============================================================
+        # calculate_buy_size 内部会乘以 risk_per_trade (如 0.98)
+        # 所以这里传入 available_cash 就能自动实现仓位控制
+        qty = self.pos_manager.calculate_buy_size(p, available_cash)
+
         if qty <= 0: return
 
+        # 计算滑点后的真实成交价 (买入要买得更贵)
         p_real = p * (1 + self.slippage_bps / 10000)
+        # 计算总成本 (含手续费)
         cost = qty * p_real * (1 + self.commission)
+
+        # 再次检查总成本 (虽然 pos_manager 算过，但滑点可能导致超额)
         if cost > self.usdt: return
 
+        # ============================================================
+        # 4. 执行扣款与持仓更新
+        # ============================================================
         self.usdt -= cost
         self.btc = qty
         self.entry_price = p_real
 
+        # 既然成功买入了，重置冷却计时器
+        self.stop_loss_cooldown_until = None
+
+        # ============================================================
+        # 5. 设置止盈止损参数 (保持原样)
+        # ============================================================
         sl_pct = sig.get('sl_pct', 0.05)
         self.target_sl_price = p_real * (1 - sl_pct)
 
@@ -231,15 +281,29 @@ class BacktestEngine:
             self.trailing_active = False
             self.highest_price_since_entry = p_real
 
-        self.trades.append({'time': t, 'type': 'BUY', 'price': p_real, 'qty': qty,
-                            'mode': 'TRAILING' if self.trailing_enabled else 'FIXED'})
+        # ============================================================
+        # 6. 记录交易日志 (增加了 strategy 和 size_mult 方便复盘)
+        # ============================================================
+        self.trades.append({
+            'time': t,
+            'type': 'BUY',
+            'price': p_real,
+            'qty': qty,
+            'mode': 'TRAILING' if self.trailing_enabled else 'FIXED',
+            'strategy': strategy_regime,  # 关键：记录这单是基于什么策略开的
+            'size_mult': size_multiplier  # 关键：记录这单用了几成仓位
+        })
 
     def _execute_sell(self, t, p, reason):
-        rev = self.btc * p * (1 - self.commission)
+        p_real = p * (1 - self.slippage_bps / 10000)
+        rev = self.btc * p_real * (1 - self.commission)
         pnl = rev - (self.btc * self.entry_price)
         pnl_pct = pnl / (self.btc * self.entry_price) * 100
         self.usdt += rev
         self.trades.append({'time': t, 'type': 'SELL', 'price': p, 'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason})
+        if "STOP_LOSS" in reason:
+            self.stop_loss_cooldown_until = t + timedelta(hours=12)
+            # print(f"❄️ 触发止损，暂停交易直到 {self.stop_loss_cooldown_until}")
         self.btc = 0
         self.entry_price = 0
 
@@ -334,7 +398,7 @@ class BacktestEngine:
 if __name__ == "__main__":
     engine = BacktestEngine(
         symbol="BTC/USDT",
-        start_date="2023-01-01 00:00:00",
-        end_date="2024-01-01 00:00:00"
+        start_date="2022-01-01 00:00:00",
+        end_date="2023-01-01 00:00:00"
     )
     engine.run()

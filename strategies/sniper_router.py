@@ -11,6 +11,8 @@ class SniperRouterStrategy(BaseStrategy):
         base_coin = symbol.split('/')[0]
         super().__init__(name=f"Sniper_v23_{base_coin}")
 
+        self.last_regime = "SHOCK_SIDEWAYS"
+
         self.ta = TechnicalAnalyzer()
         self.symbol = symbol
 
@@ -68,6 +70,22 @@ class SniperRouterStrategy(BaseStrategy):
         ai_regime = row.get('AI_REGIME')
         if not ai_regime: ai_regime = self._determine_regime_fallback(row)
 
+        # ============================================================
+        # 🔥 [新增] 稳压器 (Stabilizer): 兼容插入，不破坏原有结构
+        # ============================================================
+        # 逻辑：如果上一根K线是牛市，AI 突然喊震荡，但价格还守在 EMA55 之上 -> 强行续命
+        curr_price = row['close']
+        ma_trend = row.get('EMA_55', 0)  # 确保 technical.py 算了这个指标
+
+        if self.last_regime == 'BULL_TREND' and ai_regime == 'SHOCK_SIDEWAYS':
+            if curr_price > ma_trend:
+                # 触发防假摔机制：无视 AI 的短期震荡信号，保持牛市判断
+                ai_regime = 'BULL_TREND'
+
+        # 记录本次修正后的状态，供下一次使用
+        self.last_regime = ai_regime
+        # ============================================================
+
         actual_regime = self._technical_veto(row, ai_regime)
         signal = {'action': None}
 
@@ -99,10 +117,22 @@ class SniperRouterStrategy(BaseStrategy):
         if (ema_55 < ema_200) and (slope < 0): return "BEAR_CRASH"
         return "SHOCK_SIDEWAYS"
 
-    # ==========================================
-    # 策略逻辑 (引用 self.params)
-    # ==========================================
+        # ==========================================
+        # 策略逻辑 (引用 self.params)
+        # ==========================================
+
+        # ==========================================
+        # 策略逻辑 (引用 self.params)
+        # ==========================================
+
+        # ==========================================
+        # 策略逻辑 (引用 self.params)
+        # ==========================================
+
     def _strategy_bull_trend(self, row):
+        """
+        牛市主策略：趋势回调买入 (EMA支撑)
+        """
         close = row['close']
         ema_55 = row['EMA_55']
         rsi = row['RSI_14']
@@ -113,6 +143,7 @@ class SniperRouterStrategy(BaseStrategy):
         rsi_max = self.params['bull_rsi_entry']
         sl_pct = self.params['sl_bull']
 
+        # 逻辑：价格回调到 EMA55 附近，且 RSI 没有过热
         hit_support = close <= ema_55 * buffer
         rsi_valid = 40 < rsi < rsi_max
 
@@ -122,37 +153,35 @@ class SniperRouterStrategy(BaseStrategy):
             signal['use_trailing'] = True
             signal['trailing_start'] = sl_pct * 0.8
             signal['trailing_drop'] = sl_pct * 0.4
-            signal['tp_pct'] = 0.50
-        return signal
+            signal['tp_pct'] = 0.50  # 牛市格局打开，止盈放宽
 
-    def _strategy_bear_reversal(self, row):
-        close = row['close']
-        bb_long_lower = row['BB_Long_Lower']
-        rsi = row['RSI_14']
-        ema_5 = row['EMA_5']
-        signal = {'action': None}
+            # ============================================================
+            # 🔥 [修正] 极寒模式 (Winter Mode)
+            # ============================================================
+            # 检查 EMA200 的斜率
+            slope = row.get('Slope_200', 0)
 
-        # 🔥 从 self.params 读取
-        rsi_limit = self.params['bear_rsi_entry']
-        sl_pct = self.params['sl_bear']
+            if slope < 0:
+                # 趋势向下，说明处于深熊。哪怕 AI 喊牛，也只能轻仓试错。
+                # 强制标记为 "BEAR_CRASH" -> 触发 0.25 (1/4仓位)
+                # 这样即使止损 -7%，对总账户也只亏 -1.75%
+                signal['regime'] = "BEAR_CRASH"
+            else:
+                # 趋势向上，才是真正的牛市 -> 触发 1.0 (满仓)
+                signal['regime'] = "BULL_TREND"
 
-        is_deep = close < bb_long_lower
-        is_panic = rsi < rsi_limit
-        is_stabilized = close > ema_5
-
-        if is_deep and is_panic and is_stabilized:
-            signal['action'] = "BUY"
-            signal['sl_pct'] = sl_pct
-            signal['use_trailing'] = False
-            signal['tp_pct'] = 0.10
         return signal
 
     def _strategy_bull_correction(self, row):
+        """
+        牛市副策略：深跌捡漏 (布林带下轨)
+        """
         close = row['close']
         bb_short_lower = row['BB_Short_Lower']
         rsi = row['RSI_14']
         signal = {'action': None}
 
+        # 逻辑：牛市里偶尔急跌插针到布林带下轨
         hit_lower = close <= bb_short_lower * 1.005
         rsi_oversold = rsi < 45
 
@@ -165,9 +194,56 @@ class SniperRouterStrategy(BaseStrategy):
             signal['trailing_start'] = sl_base * 0.6
             signal['trailing_drop'] = sl_base * 0.3
             signal['tp_pct'] = 0.20
+
+            # ============================================================
+            # 🔥 [修正] 极寒模式 (Winter Mode)
+            # ============================================================
+            slope = row.get('Slope_200', 0)
+
+            if slope < 0:
+                # 熊市里的深跌往往是无底洞
+                # 强制标记为 "BEAR_CRASH" -> 触发 0.25 (1/4仓位)
+                signal['regime'] = "BEAR_CRASH"
+            else:
+                # 牛市黄金坑 -> 触发 1.0 (满仓)
+                signal['regime'] = "BULL_TREND"
+
+        return signal
+
+    def _strategy_bear_reversal(self, row):
+        """
+        熊市策略：只接恐慌深针 (反转博弈)
+        """
+        close = row['close']
+        bb_long_lower = row['BB_Long_Lower']
+        rsi = row['RSI_14']
+        ema_5 = row['EMA_5']
+        signal = {'action': None}
+
+        # 🔥 从 self.params 读取
+        rsi_limit = self.params['bear_rsi_entry']
+        sl_pct = self.params['sl_bear']
+
+        # 逻辑：跌破长期布林下轨 + RSI极度恐慌 + 短期有企稳迹象(站上EMA5)
+        is_deep = close < bb_long_lower
+        is_panic = rsi < rsi_limit
+        is_stabilized = close > ema_5
+
+        if is_deep and is_panic and is_stabilized:
+            signal['action'] = "BUY"
+            signal['sl_pct'] = sl_pct
+            signal['use_trailing'] = False
+            signal['tp_pct'] = 0.10  # 熊市抢反弹，吃一口就跑
+
+            # 🔥 [关键] 标记这是熊市策略 -> 对应 1/4 仓位 (0.25)
+            signal['regime'] = "BEAR_CRASH"
+
         return signal
 
     def _strategy_sideways(self, row):
+        """
+        震荡策略：布林带内高抛低吸
+        """
         close = row['close']
         bb_short_lower = row['BB_Short_Lower']
         bb_short_mid = row['BB_Short_Mid']
@@ -181,6 +257,7 @@ class SniperRouterStrategy(BaseStrategy):
         rsi_entry = self.params['shock_rsi_entry']
         sl_pct = self.params['sl_shock']
 
+        # 过滤：ADX 太高说明有趋势，不做震荡；布林太窄说明没肉吃，不做
         if adx > 25: return signal
         if bb_width < min_width: return signal
 
@@ -190,8 +267,13 @@ class SniperRouterStrategy(BaseStrategy):
         if hit_lower and rsi_weak:
             signal['action'] = "BUY"
             signal['sl_pct'] = sl_pct
-            signal['use_trailing'] = False
+            signal['use_trailing'] = False  # 震荡市用固定止盈更稳
 
+            # 动态止盈：目标是回归中轨 (Middle Band)
             dist_to_mid = (bb_short_mid - close) / close
             signal['tp_pct'] = max(0.015, min(dist_to_mid * 0.9, 0.05))
+
+            # 🔥 [关键] 标记这是震荡策略 -> 对应半仓 (0.5)
+            signal['regime'] = "SHOCK_SIDEWAYS"
+
         return signal

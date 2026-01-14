@@ -129,7 +129,6 @@ class TradingEngine:
 
             signal = strategy.check_signal(row_for_strategy)
 
-            # 🔥🔥🔥 [修正] 处理 None 值的打印逻辑 🔥🔥🔥
             raw_action = signal.get('action')
 
             # 如果 raw_action 是 None (空) 或者 "WAIT" (字符串)，都算观望
@@ -139,7 +138,6 @@ class TradingEngine:
                 logger.info(f"🚦 [策略判定] 观望 (WAIT) - {wait_reason}")
             else:
                 logger.info(f"🚦 [策略判定] 信号触发: {raw_action} !!!")
-            # 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
 
             # 下面的判断也要跟着改，用 raw_action
             if raw_action == "BUY":
