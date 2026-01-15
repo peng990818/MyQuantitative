@@ -153,21 +153,21 @@ class SniperRouterStrategy(BaseStrategy):
             signal['use_trailing'] = True
             signal['trailing_start'] = sl_pct * 0.8
             signal['trailing_drop'] = sl_pct * 0.4
-            signal['tp_pct'] = 0.50  # 牛市格局打开，止盈放宽
+            signal['tp_pct'] = 0.50
 
             # ============================================================
-            # 🔥 [修正] 极寒模式 (Winter Mode)
+            # 🔥 [修复版] 极寒模式 (Winter Mode)
+            # 弃用 Slope，改用 "现价 vs EMA200"
             # ============================================================
-            # 检查 EMA200 的斜率
-            slope = row.get('Slope_200', 0)
+            ema_200 = row.get('EMA_200', 0)  # 确保 technical.py 算了 EMA_200
 
-            if slope < 0:
-                # 趋势向下，说明处于深熊。哪怕 AI 喊牛，也只能轻仓试错。
-                # 强制标记为 "BEAR_CRASH" -> 触发 0.25 (1/4仓位)
-                # 这样即使止损 -7%，对总账户也只亏 -1.75%
+            # 如果 EMA200 存在，且当前价格在年线之下 -> 认定为深熊
+            if ema_200 > 0 and row['close'] < ema_200:
+                # 熊市由于流动性差，假突破极多
+                # 强制降级为 0.25 (1/4仓位)
                 signal['regime'] = "BEAR_CRASH"
             else:
-                # 趋势向上，才是真正的牛市 -> 触发 1.0 (满仓)
+                # 站上年线，才是真正的牛市
                 signal['regime'] = "BULL_TREND"
 
         return signal
@@ -187,7 +187,6 @@ class SniperRouterStrategy(BaseStrategy):
 
         if hit_lower and rsi_oversold:
             signal['action'] = "BUY"
-            # 牛市回调的止损通常比追涨止损稍微紧一点
             sl_base = self.params['sl_bull']
             signal['sl_pct'] = sl_base * 0.9
             signal['use_trailing'] = True
@@ -196,16 +195,15 @@ class SniperRouterStrategy(BaseStrategy):
             signal['tp_pct'] = 0.20
 
             # ============================================================
-            # 🔥 [修正] 极寒模式 (Winter Mode)
+            # 🔥 [修复版] 极寒模式
             # ============================================================
-            slope = row.get('Slope_200', 0)
+            ema_200 = row.get('EMA_200', 0)
 
-            if slope < 0:
-                # 熊市里的深跌往往是无底洞
-                # 强制标记为 "BEAR_CRASH" -> 触发 0.25 (1/4仓位)
+            if ema_200 > 0 and row['close'] < ema_200:
+                # 熊市深蹲 -> 轻仓博弈
                 signal['regime'] = "BEAR_CRASH"
             else:
-                # 牛市黄金坑 -> 触发 1.0 (满仓)
+                # 牛市黄金坑 -> 满仓干
                 signal['regime'] = "BULL_TREND"
 
         return signal
