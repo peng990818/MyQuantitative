@@ -399,6 +399,6 @@ if __name__ == "__main__":
     engine = BacktestEngine(
         symbol="BTC/USDT",
         start_date="2021-01-01 00:00:00",
-        end_date="2022-06-30 00:00:00"
+        end_date="2024-01-01 00:00:00"
     )
     engine.run()

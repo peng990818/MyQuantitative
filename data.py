@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 def generate_realistic_regime():
     # 🔥 [新增] 固定随机种子，保证每次生成的"噪音"位置都一样
     # 方便你调试策略参数 (控制变量法)
-    random.seed(42)
+    random.seed(44)
 
     os.makedirs('data', exist_ok=True)
     file_path = 'data/ai_regime.csv'
@@ -115,7 +115,7 @@ def generate_realistic_regime():
     df.to_csv(file_path, index=False)
     print(f"✅ 拟真剧本已更新: {file_path}")
     print(f"📊 数据范围: {all_data[0]['date']} -> {all_data[-1]['date']}")
-    print("💡 已加入随机种子(Seed=42)，结果可复现。")
+    print("💡 已加入随机种子(Seed=44)，结果可复现。")
 
 
 if __name__ == "__main__":

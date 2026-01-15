@@ -65,3 +65,23 @@ class StateManager:
         if symbol in self.data["positions"]:
             del self.data["positions"][symbol]
             self._save_state()
+
+        # 加在 StateManager 类里
+
+    def set_cooldown(self, symbol, timestamp):
+        """设置冷却结束时间戳 (float)"""
+        if 'cooldowns' not in self.state:
+            self.state['cooldowns'] = {}
+        self.state['cooldowns'][symbol] = timestamp
+        self._save_state()
+
+    def get_cooldown(self, symbol):
+        """获取冷却结束时间戳，如果不存在或已过期返回 0"""
+        cooldowns = self.state.get('cooldowns', {})
+        return cooldowns.get(symbol, 0)
+
+    def update_position_high(self, symbol, new_high):
+        """更新持仓的最高价格 (用于移动止盈)"""
+        if symbol in self.state.get('positions', {}):
+            self.state['positions'][symbol]['highest_price'] = new_high
+            self._save_state()
